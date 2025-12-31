@@ -268,6 +268,9 @@ int WINAPI wWinMain(
     PWSTR lpCmdLine,
     int)
 {
+    // ★ 新增：释放 Explorer 自动分配的控制台
+    FreeConsole();
+
     if (!lpCmdLine || !*lpCmdLine)
     {
         MessageBoxW(nullptr, L"请指定要运行的程序", L"ConsoleLoader", MB_ICONERROR);
