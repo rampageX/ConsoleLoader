@@ -5,10 +5,11 @@
 #include <dwmapi.h>
 #include <richedit.h>
 #include <string>
+#include <cwctype>
 
 #pragma comment(lib, "dwmapi.lib")
 
-/* ================= 全局（OK5 核心原样） ================= */
+/* ================= 全局（核心原样） ================= */
 
 HWND   g_hWnd  = nullptr;
 HWND   g_hEdit = nullptr;
@@ -62,6 +63,111 @@ bool IsDarkMode()
     return v == 0;
 }
 
+void AppendText(const std::wstring& text)
+{
+    // 1. 插入前长度
+    GETTEXTLENGTHEX gtl{};
+    gtl.flags = GTL_NUMCHARS;
+    gtl.codepage = 1200; // UTF-16
+
+    LONG base = (LONG)SendMessageW(
+        g_hEdit,
+        EM_GETTEXTLENGTHEX,
+        (WPARAM)&gtl,
+        0);
+
+    // 2. 插入文本
+    SendMessageW(g_hEdit, EM_SETSEL, -1, -1);
+    SendMessageW(g_hEdit, EM_REPLACESEL, FALSE, (LPARAM)text.c_str());
+
+    // ====== 开始解析本行 ======
+
+    const COLORREF RED    = RGB(255, 80, 80);
+    const COLORREF YELLOW = RGB(255, 200, 80);
+    const COLORREF GREEN  = RGB(120, 220, 120);
+
+    const wchar_t* s = text.c_str();
+    int len = (int)text.size();
+
+    int latency = -1;
+    int latPos  = -1;
+    int latLen  = 0;
+
+    // 3. 找 延迟数字 + ms
+    for (int i = 0; i < len; i++)
+    {
+        if (iswdigit(s[i]))
+        {
+            int j = i;
+            int v = 0;
+
+            while (j < len && iswdigit(s[j]))
+            {
+                v = v * 10 + (s[j] - L'0');
+                j++;
+            }
+
+            if (j + 1 < len && s[j] == L'm' && s[j + 1] == L's')
+            {
+                latency = v;
+                latPos  = i;
+                latLen  = (j + 2) - i;
+                break;
+            }
+        }
+    }
+
+    if (latency < 0)
+    {
+        SendMessageW(g_hEdit, EM_SCROLLCARET, 0, 0);
+        return;
+    }
+
+    COLORREF color =
+        (latency > 500) ? RED :
+        (latency >= 200) ? YELLOW :
+                           GREEN;
+
+    // 4. 给 延迟(ms) 着色
+    {
+        CHARRANGE cr{ base + latPos, base + latPos + latLen };
+        SendMessageW(g_hEdit, EM_EXSETSEL, 0, (LPARAM)&cr);
+
+        CHARFORMATW cf{};
+        cf.cbSize = sizeof(cf);
+        cf.dwMask = CFM_COLOR;
+        cf.crTextColor = color;
+
+        SendMessageW(g_hEdit, EM_SETCHARFORMAT, SCF_SELECTION, (LPARAM)&cf);
+    }
+
+    // 5. 给 “域名/IP:端口” 着色
+    // 规则：行首到第一个空格 / tab / '['
+    int hostEnd = 0;
+    while (hostEnd < len &&
+           s[hostEnd] != L' ' &&
+           s[hostEnd] != L'\t' &&
+           s[hostEnd] != L'[')
+    {
+        hostEnd++;
+    }
+
+    if (hostEnd > 0)
+    {
+        CHARRANGE cr{ base, base + hostEnd };
+        SendMessageW(g_hEdit, EM_EXSETSEL, 0, (LPARAM)&cr);
+
+        CHARFORMATW cf{};
+        cf.cbSize = sizeof(cf);
+        cf.dwMask = CFM_COLOR;
+        cf.crTextColor = color;
+
+        SendMessageW(g_hEdit, EM_SETCHARFORMAT, SCF_SELECTION, (LPARAM)&cf);
+    }
+
+    SendMessageW(g_hEdit, EM_SCROLLCARET, 0, 0);
+}
+
 void ApplyDarkTitleBar(HWND hwnd)
 {
     BOOL dark = IsDarkMode();
@@ -92,7 +198,7 @@ void ApplyDarkRichEdit(HWND hEdit)
     SendMessageW(hEdit, EM_SETCHARFORMAT, SCF_ALL, (LPARAM)&cf);
 }
 
-/* ================= 工具（OK5 原样） ================= */
+/* ================= 工具 ================= */
 
 std::wstring AnsiToWideOEM(const char* s)
 {
@@ -102,14 +208,7 @@ std::wstring AnsiToWideOEM(const char* s)
     return ws;
 }
 
-void AppendText(const std::wstring& text)
-{
-    SendMessageW(g_hEdit, EM_SETSEL, -1, -1);
-    SendMessageW(g_hEdit, EM_REPLACESEL, FALSE, (LPARAM)text.c_str());
-    SendMessageW(g_hEdit, EM_SCROLLCARET, 0, 0);
-}
-
-/* ================= 管道线程（OK5 原样） ================= */
+/* ================= 管道线程 ================= */
 
 DWORD WINAPI PipeThread(LPVOID)
 {
@@ -157,7 +256,6 @@ DWORD WINAPI PipeThread(LPVOID)
             auto* ws = new std::wstring(AnsiToWideOEM(line.c_str()));
             PostMessageW(g_hWnd, WM_APPEND, 0, (LPARAM)ws);
         }
-
     }
 
     if (!partial.empty())
@@ -169,7 +267,7 @@ DWORD WINAPI PipeThread(LPVOID)
     return 0;
 }
 
-/* ================= 窗口过程（只改 UI） ================= */
+/* ================= 窗口过程 ================= */
 
 LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l)
 {
@@ -260,7 +358,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l)
     return DefWindowProcW(hWnd, msg, w, l);
 }
 
-/* ================= 入口（OK5 核心原样） ================= */
+/* ================= 入口 ================= */
 
 int WINAPI wWinMain(
     HINSTANCE hInst,
