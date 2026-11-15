@@ -150,6 +150,35 @@ static ScrollMetrics GetScrollMetrics(int clientHeight)
     return m;
 }
 
+// Keep the document full width when it fits. When it overflows, the
+// custom scrollbar occupies only its own 12px area; no unpainted seam remains.
+static void UpdateScrollLayout()
+{
+    if (!g_hWnd || !g_hEdit || !g_hScroll) return;
+
+    RECT rc{};
+    GetClientRect(g_hWnd, &rc);
+    const int width = (std::max)(0, rc.right - rc.left - 2);
+    const int height = (std::max)(0, rc.bottom - rc.top - 2);
+    constexpr int barWidth = 12;
+
+    // First measure with all available width. A narrower editor could
+    // introduce soft-wrapped lines that disappear when the bar is hidden.
+    MoveWindow(g_hEdit, 1, 1, width, height, TRUE);
+    const ScrollMetrics full = GetScrollMetrics(height);
+    const bool needBar = height > 0 && width > barWidth && full.maxFirst > 0;
+
+    if (needBar)
+    {
+        MoveWindow(g_hEdit, 1, 1, width - barWidth, height, TRUE);
+        MoveWindow(g_hScroll, 1 + width - barWidth, 1, barWidth, height, TRUE);
+        ShowWindow(g_hScroll, SW_SHOWNOACTIVATE);
+        InvalidateRect(g_hScroll, nullptr, FALSE);
+    }
+    else
+        ShowWindow(g_hScroll, SW_HIDE);
+}
+
 static void ScrollToPoint(int y, int offset)
 {
     if (!g_hScroll || !g_hEdit) return;
@@ -429,8 +458,15 @@ void AppendText(const std::wstring& text)
     else
         SendMessageW(g_hEdit, EM_SETSCROLLPOS, 0, reinterpret_cast<LPARAM>(&oldScroll));
     SendMessageW(g_hEdit, WM_SETREDRAW, TRUE, 0);
+    UpdateScrollLayout();
+    if (follow)
+    {
+        SendMessageW(g_hEdit, EM_SETSEL, -1, -1);
+        SendMessageW(g_hEdit, EM_SCROLLCARET, 0, 0);
+    }
     InvalidateRect(g_hEdit, nullptr, FALSE);
-    if (g_hScroll) InvalidateRect(g_hScroll, nullptr, FALSE);
+    if (g_hScroll && IsWindowVisible(g_hScroll))
+        InvalidateRect(g_hScroll, nullptr, FALSE);
 }
 
 void ApplyDarkTitleBar(HWND hwnd)
@@ -563,7 +599,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l)
         g_OrigEditProc = (WNDPROC)SetWindowLongPtrW(g_hEdit, GWLP_WNDPROC, (LONG_PTR)EditSubclassProc);
 
         g_hScroll = CreateWindowExW(0, L"ConsoleLoaderScrollbar", L"",
-                                    WS_CHILD | WS_VISIBLE,
+                                    WS_CHILD,
                                     0, 0, 12, 0, hWnd, nullptr,
                                     GetModuleHandleW(nullptr), nullptr);
 
@@ -620,38 +656,31 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l)
     case WM_SETTINGCHANGE:
         ApplyDarkTitleBar(hWnd);
         ApplyDarkRichEdit(g_hEdit);
+        UpdateScrollLayout();
         InvalidateRect(hWnd, nullptr, TRUE);
-        if (g_hScroll) InvalidateRect(g_hScroll, nullptr, TRUE);
+        if (g_hScroll && IsWindowVisible(g_hScroll))
+            InvalidateRect(g_hScroll, nullptr, TRUE);
         return 0;
 
     case WM_SIZE:
-    {
-        int width = (std::max)(0, static_cast<int>(LOWORD(l)));
-        int height = (std::max)(0, static_cast<int>(HIWORD(l)));
-        const int scrollbarWidth = 13;
-        if (g_hEdit) MoveWindow(g_hEdit, 1, 1,
-                        (std::max)(0, width - scrollbarWidth - 2),
-                        (std::max)(0, height - 2), TRUE);
-        if (g_hScroll) MoveWindow(g_hScroll, width - scrollbarWidth, 1,
-                        scrollbarWidth - 1, (std::max)(0, height - 2), TRUE);
+        UpdateScrollLayout();
         return 0;
-    }
+
+    case WM_ERASEBKGND:
+        return 1;
 
     case WM_PAINT:
     {
-        PAINTSTRUCT ps;
-        HDC hdc = BeginPaint(hWnd, &ps);
-
-        if (IsDarkMode())
-        {
-            RECT rc;
-            GetClientRect(hWnd, &rc);
-
-            HBRUSH hBrush = CreateSolidBrush(RGB(55,55,55));
-            FrameRect(hdc, &rc, hBrush);
-            DeleteObject(hBrush);
-        }
-
+        PAINTSTRUCT ps{};
+        HDC dc = BeginPaint(hWnd, &ps);
+        RECT rc{};
+        GetClientRect(hWnd, &rc);
+        // Match the RichEdit background exactly, including the 1px window
+        // margins; no bright vertical seam or artificial border.
+        HBRUSH background = CreateSolidBrush(
+            IsDarkMode() ? RGB(30,30,30) : RGB(255,255,255));
+        FillRect(dc, &rc, background);
+        DeleteObject(background);
         EndPaint(hWnd, &ps);
         return 0;
     }
@@ -746,9 +775,24 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
     scrollClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     RegisterClassW(&scrollClass);
 
+    // Centre the window in the monitor work area containing the cursor.
+    // The work area excludes the taskbar; explicit dimensions remain exact.
+    POINT cursor{};
+    GetCursorPos(&cursor);
+    HMONITOR monitor = MonitorFromPoint(cursor, MONITOR_DEFAULTTOPRIMARY);
+    MONITORINFO monitorInfo{};
+    monitorInfo.cbSize = sizeof(monitorInfo);
+    int left = CW_USEDEFAULT, top = CW_USEDEFAULT;
+    if (GetMonitorInfoW(monitor, &monitorInfo))
+    {
+        const RECT& work = monitorInfo.rcWork;
+        left = work.left + ((work.right - work.left) - width) / 2;
+        top = work.top + ((work.bottom - work.top) - height) / 2;
+    }
+
     g_baseTitle = L"ConsoleLoader - " + target;
     g_hWnd = CreateWindowW(wc.lpszClassName, g_baseTitle.c_str(),
-            WS_OVERLAPPEDWINDOW | WS_VISIBLE, CW_USEDEFAULT, CW_USEDEFAULT,
+            WS_OVERLAPPEDWINDOW | WS_VISIBLE, left, top,
             width, height, nullptr, nullptr, hInst, nullptr);
     if (!g_hWnd) return 1;
 
