@@ -795,6 +795,9 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
             WS_OVERLAPPEDWINDOW | WS_VISIBLE, left, top,
             width, height, nullptr, nullptr, hInst, nullptr);
     if (!g_hWnd) return 1;
+    // WM_SIZE during CreateWindow precedes assignment to g_hWnd.
+    // Lay out child controls once the main window handle is available.
+    UpdateScrollLayout();
 
     g_hJob = CreateJobObjectW(nullptr, nullptr);
     if (g_hJob)
