@@ -29,6 +29,7 @@ std::atomic<bool> g_shuttingDown{false};
 #define WM_APPEND (WM_APP + 1)
 #define IDM_COPY_SIZE 0x1F00
 #define TIMER_COPY_NOTICE 7
+#define TIMER_CI_CLOSE 8
 
 std::wstring g_baseTitle;
 
@@ -652,6 +653,12 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l)
         break;
 
     case WM_TIMER:
+        if (w == TIMER_CI_CLOSE)
+        {
+            KillTimer(hWnd, TIMER_CI_CLOSE);
+            PostMessageW(hWnd, WM_CLOSE, 0, 0);
+            return 0;
+        }
         if (w == TIMER_COPY_NOTICE)
         {
             KillTimer(hWnd, TIMER_COPY_NOTICE);
@@ -703,6 +710,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l)
     case WM_DESTROY:
     {
         KillTimer(hWnd, TIMER_COPY_NOTICE);
+        KillTimer(hWnd, TIMER_CI_CLOSE);
 
         // Stop the pipe worker *before* closing its read handle.
         // A detached GUI child can keep an inherited stdout pipe writer open,
@@ -846,6 +854,14 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
     // WM_SIZE during CreateWindow precedes assignment to g_hWnd.
     // Lay out child controls once the main window handle is available.
     UpdateScrollLayout();
+
+    // Regression-runner hook: GitHub's Windows service desktop cannot
+    // enumerate GUI windows from the test process. This environment variable
+    // makes the app deliver WM_CLOSE to itself; normal launches are unchanged.
+    wchar_t ciCloseFlag[8]{};
+    if (GetEnvironmentVariableW(L"CONSOLELOADER_CI_AUTOCLOSE", ciCloseFlag, 8) &&
+        wcscmp(ciCloseFlag, L"1") == 0)
+        SetTimer(g_hWnd, TIMER_CI_CLOSE, 2000, nullptr);
 
     g_hJob = CreateJobObjectW(nullptr, nullptr);
     if (g_hJob)
