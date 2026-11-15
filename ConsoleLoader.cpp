@@ -758,7 +758,11 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
     if (g_hJob)
     {
         JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
-        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        // Clean up only the explicitly assigned console process. Child applications
+        // launched by a batch script (for example 'start Proxifier.exe') escape
+        // silently and must survive closing the ConsoleLoader window.
+        limits.BasicLimitInformation.LimitFlags =
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK;
         SetInformationJobObject(g_hJob, JobObjectExtendedLimitInformation, &limits, sizeof(limits));
     }
 
