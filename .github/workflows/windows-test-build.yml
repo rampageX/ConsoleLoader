@@ -1,0 +1,84 @@
+name: ConsoleLoader Windows x64 build
+
+on:
+  push:
+    branches:
+      - master
+      - feature/window-size-highlight
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-binutils
+      - name: Build ConsoleLoader
+        shell: msys2 {0}
+        run: |
+          windres ConsoleLoader.rc -O coff -o ConsoleLoader_res.o
+          g++ -std=c++17 -O2 -pipe -municode -mwindows ConsoleLoader.cpp ConsoleLoader_res.o -o ConsoleLoader.exe -static-libstdc++ -static-libgcc -lole32 -luuid -lcomctl32 -ldwmapi -lgdi32 -lshell32
+      - name: Upload Windows executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: ConsoleLoader-win-x64-test
+          path: ConsoleLoader.exe
+          if-no-files-found: error
+
+  release:
+    # Explicitly publish 0.4 once, when merging the maintainer-tested code
+    # under a release-marked merge commit on master. No automatic upgrades.
+    if: "${{ github.event_name == 'push' && github.ref == 'refs/heads/master' && startsWith(github.event.head_commit.message, 'release: 0.4') }}"
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download verified build
+        uses: actions/download-artifact@v4
+        with:
+          name: ConsoleLoader-win-x64-test
+          path: .
+      - name: Validate Windows x64 artifact
+        run: |
+          test -s ConsoleLoader.exe
+          file ConsoleLoader.exe | grep -Fq 'PE32+ executable'
+          file ConsoleLoader.exe | grep -Fq 'x86-64'
+          sha256sum ConsoleLoader.exe
+      - name: Create release 0.4
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          if gh release view 0.4 >/dev/null 2>&1; then
+            echo "::error::Release 0.4 already exists. Refusing to overwrite it."
+            exit 1
+          fi
+          cat > RELEASE_NOTES.md <<'EOF'
+          ## ConsoleLoader 0.4
+
+          - **Custom window size:** add `WIDTHxHEIGHT` at the end of the shortcut command, for example `ConsoleLoader.exe "script.cmd" 430x220`.
+          - **Copy window size:** right-click the title bar and copy the current outer window dimensions.
+          - **Centered startup:** open on the monitor containing the mouse pointer, centered within its work area.
+          - **Polished GUI:** light/dark custom scrollbar appears only when needed, without bright seams.
+          - **Status highlighting:** common service states, success/error/warning messages, and latency values.
+          - **Output support:** UTF-8 with legacy OEM code page fallback, batched UI output and clearer startup errors.
+          - **Process lifetime:** GUI applications independently launched by a batch script can survive closing ConsoleLoader.
+
+          **Compatibility:** Windows x64. Built with MSYS2 UCRT64 / C++17.
+          **Validation:** GitHub Actions Windows x64 build and maintainer testing.
+          EOF
+          gh release create 0.4 ConsoleLoader.exe \
+            --title "ConsoleLoader 0.4" \
+            --target "$GITHUB_SHA" \
+            --notes-file RELEASE_NOTES.md \
+            --latest
