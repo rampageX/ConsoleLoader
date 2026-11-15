@@ -1,5 +1,3 @@
-#define UNICODE
-#define _UNICODE
 
 #include <windows.h>
 #include <dwmapi.h>
@@ -141,7 +139,7 @@ static ScrollMetrics GetScrollMetrics(int clientHeight)
     RECT rc{};
     GetClientRect(g_hEdit, &rc);
     m.count = (std::max)(1, static_cast<int>(SendMessageW(g_hEdit, EM_GETLINECOUNT, 0, 0)));
-    m.visible = (std::max)(1, (rc.bottom - rc.top) / EditLineHeight());
+    m.visible = (std::max)(1, static_cast<int>((rc.bottom - rc.top) / EditLineHeight()));
     m.first = (std::max)(0, static_cast<int>(SendMessageW(g_hEdit, EM_GETFIRSTVISIBLELINE, 0, 0)));
     m.maxFirst = (std::max)(0, m.count - m.visible);
     m.first = (std::min)(m.first, m.maxFirst);
@@ -410,7 +408,7 @@ void AppendText(const std::wstring& text)
     GetTextMetricsW(dc, &tm);
     SelectObject(dc, oldFont);
     ReleaseDC(g_hEdit, dc);
-    int visible = (std::max)(1, (rc.bottom - rc.top) / (std::max)(1L, tm.tmHeight));
+    int visible = (std::max)(1, static_cast<int>((rc.bottom - rc.top) / (std::max)(1L, tm.tmHeight)));
     bool follow = (first + visible >= lines - 2);
 
     SendMessageW(g_hEdit, WM_SETREDRAW, FALSE, 0);
