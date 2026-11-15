@@ -18,6 +18,7 @@
 
 HWND   g_hWnd  = nullptr;
 HWND   g_hEdit = nullptr;
+HWND   g_hScroll = nullptr;
 HANDLE g_hRead = nullptr;
 HANDLE g_hProc = nullptr;
 HANDLE g_hJob  = nullptr;
@@ -101,6 +102,126 @@ static bool CopyClipboard(HWND owner, const std::wstring& data)
     return true;
 }
 
+/* ================= 自绘轻量滚动条（明暗主题均不依赖系统皮肤） ================= */
+
+bool IsDarkMode();
+
+static int g_dragOffset = -1;
+
+struct ScrollMetrics
+{
+    int count = 1;
+    int visible = 1;
+    int first = 0;
+    int maxFirst = 0;
+    int thumbTop = 0;
+    int thumbHeight = 0;
+};
+
+static int EditLineHeight()
+{
+    if (!g_hEdit) return 16;
+    HDC dc = GetDC(g_hEdit);
+    if (!dc) return 16;
+    HFONT font = reinterpret_cast<HFONT>(SendMessageW(g_hEdit, WM_GETFONT, 0, 0));
+    HGDIOBJ previous = font ? SelectObject(dc, font) : nullptr;
+    TEXTMETRICW metrics{};
+    GetTextMetricsW(dc, &metrics);
+    if (previous) SelectObject(dc, previous);
+    ReleaseDC(g_hEdit, dc);
+    return (std::max)(1L, metrics.tmHeight);
+}
+
+static ScrollMetrics GetScrollMetrics(int clientHeight)
+{
+    ScrollMetrics m;
+    if (!g_hEdit) return m;
+    RECT rc{};
+    GetClientRect(g_hEdit, &rc);
+    m.count = (std::max)(1, static_cast<int>(SendMessageW(g_hEdit, EM_GETLINECOUNT, 0, 0)));
+    m.visible = (std::max)(1, (rc.bottom - rc.top) / EditLineHeight());
+    m.first = (std::max)(0, static_cast<int>(SendMessageW(g_hEdit, EM_GETFIRSTVISIBLELINE, 0, 0)));
+    m.maxFirst = (std::max)(0, m.count - m.visible);
+    m.first = (std::min)(m.first, m.maxFirst);
+    m.thumbHeight = m.maxFirst == 0 ? clientHeight :
+        (std::min)(clientHeight, (std::max)(28, clientHeight * m.visible / m.count));
+    m.thumbTop = m.maxFirst == 0 ? 0 :
+        (clientHeight - m.thumbHeight) * m.first / m.maxFirst;
+    return m;
+}
+
+static void ScrollToPoint(int y, int offset)
+{
+    if (!g_hScroll || !g_hEdit) return;
+    RECT rc{};
+    GetClientRect(g_hScroll, &rc);
+    const int height = rc.bottom - rc.top;
+    ScrollMetrics m = GetScrollMetrics(height);
+    if (m.maxFirst == 0) return;
+    const int track = (std::max)(1, height - m.thumbHeight);
+    int top = (std::max)(0, (std::min)(track, y - offset));
+    int targetLine = (top * m.maxFirst + track / 2) / track;
+    SendMessageW(g_hEdit, EM_LINESCROLL, 0, targetLine - m.first);
+    InvalidateRect(g_hScroll, nullptr, FALSE);
+}
+
+static LRESULT CALLBACK ScrollBarProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l)
+{
+    switch (msg)
+    {
+    case WM_ERASEBKGND: return 1;
+    case WM_PAINT:
+    {
+        PAINTSTRUCT ps{};
+        HDC dc = BeginPaint(hwnd, &ps);
+        RECT rc{};
+        GetClientRect(hwnd, &rc);
+        const bool dark = IsDarkMode();
+        HBRUSH track = CreateSolidBrush(dark ? RGB(30,30,30) : RGB(245,245,245));
+        FillRect(dc, &rc, track);
+        DeleteObject(track);
+        ScrollMetrics m = GetScrollMetrics(rc.bottom - rc.top);
+        if (m.maxFirst > 0)
+        {
+            RECT thumb{2, m.thumbTop, rc.right - 2, m.thumbTop + m.thumbHeight};
+            HBRUSH brush = CreateSolidBrush(dark ?
+                (GetCapture() == hwnd ? RGB(150,150,150) : RGB(95,95,95)) :
+                (GetCapture() == hwnd ? RGB(130,130,130) : RGB(175,175,175)));
+            FillRect(dc, &thumb, brush);
+            DeleteObject(brush);
+        }
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+    case WM_LBUTTONDOWN:
+    {
+        RECT rc{};
+        GetClientRect(hwnd, &rc);
+        ScrollMetrics m = GetScrollMetrics(rc.bottom - rc.top);
+        int y = static_cast<short>(HIWORD(l));
+        g_dragOffset = (y >= m.thumbTop && y < m.thumbTop + m.thumbHeight) ?
+                       y - m.thumbTop : m.thumbHeight / 2;
+        SetCapture(hwnd);
+        ScrollToPoint(y, g_dragOffset);
+        return 0;
+    }
+    case WM_MOUSEMOVE:
+        if (GetCapture() == hwnd && g_dragOffset >= 0)
+            ScrollToPoint(static_cast<short>(HIWORD(l)), g_dragOffset);
+        return 0;
+    case WM_LBUTTONUP:
+    case WM_CAPTURECHANGED:
+        if (msg == WM_LBUTTONUP && GetCapture() == hwnd) ReleaseCapture();
+        g_dragOffset = -1;
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return 0;
+    case WM_MOUSEWHEEL:
+        if (g_hEdit) SendMessageW(g_hEdit, WM_MOUSEWHEEL, w, l);
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, w, l);
+}
+
 /* ================= 仅为滚轮支持新增：RichEdit 子类化 ================= */
 
 static WNDPROC g_OrigEditProc = nullptr;
@@ -118,10 +239,15 @@ static LRESULT CALLBACK EditSubclassProc(HWND hWnd, UINT msg, WPARAM wParam, LPA
 
         // delta>0 通常表示“滚轮向前”，内容应上移 => EM_LINESCROLL 传负数
         SendMessageW(hWnd, EM_LINESCROLL, 0, (LPARAM)(-lines));
+        if (g_hScroll) InvalidateRect(g_hScroll, nullptr, FALSE);
         return 0;
     }
     }
-    return CallWindowProcW(g_OrigEditProc, hWnd, msg, wParam, lParam);
+    LRESULT result = CallWindowProcW(g_OrigEditProc, hWnd, msg, wParam, lParam);
+    if (g_hScroll && (msg == WM_KEYDOWN || msg == WM_VSCROLL ||
+                      msg == WM_LBUTTONUP || msg == WM_SIZE))
+        InvalidateRect(g_hScroll, nullptr, FALSE);
+    return result;
 }
 
 /* ================= Dark Mode ================= */
@@ -304,6 +430,7 @@ void AppendText(const std::wstring& text)
         SendMessageW(g_hEdit, EM_SETSCROLLPOS, 0, reinterpret_cast<LPARAM>(&oldScroll));
     SendMessageW(g_hEdit, WM_SETREDRAW, TRUE, 0);
     InvalidateRect(g_hEdit, nullptr, FALSE);
+    if (g_hScroll) InvalidateRect(g_hScroll, nullptr, FALSE);
 }
 
 void ApplyDarkTitleBar(HWND hwnd)
@@ -435,6 +562,11 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l)
         // RichEdit 子类化：只为滚轮支持，不改你现有输出逻辑
         g_OrigEditProc = (WNDPROC)SetWindowLongPtrW(g_hEdit, GWLP_WNDPROC, (LONG_PTR)EditSubclassProc);
 
+        g_hScroll = CreateWindowExW(0, L"ConsoleLoaderScrollbar", L"",
+                                    WS_CHILD | WS_VISIBLE,
+                                    0, 0, 12, 0, hWnd, nullptr,
+                                    GetModuleHandleW(nullptr), nullptr);
+
         HMENU systemMenu = GetSystemMenu(hWnd, FALSE);
         if (systemMenu)
         {
@@ -489,16 +621,21 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l)
         ApplyDarkTitleBar(hWnd);
         ApplyDarkRichEdit(g_hEdit);
         InvalidateRect(hWnd, nullptr, TRUE);
+        if (g_hScroll) InvalidateRect(g_hScroll, nullptr, TRUE);
         return 0;
 
     case WM_SIZE:
-        MoveWindow(
-            g_hEdit,
-            1, 1,
-            LOWORD(l) - 2,
-            HIWORD(l) - 2,
-            TRUE);
+    {
+        int width = (std::max)(0, static_cast<int>(LOWORD(l)));
+        int height = (std::max)(0, static_cast<int>(HIWORD(l)));
+        const int scrollbarWidth = 13;
+        if (g_hEdit) MoveWindow(g_hEdit, 1, 1,
+                        (std::max)(0, width - scrollbarWidth - 2),
+                        (std::max)(0, height - 2), TRUE);
+        if (g_hScroll) MoveWindow(g_hScroll, width - scrollbarWidth, 1,
+                        scrollbarWidth - 1, (std::max)(0, height - 2), TRUE);
         return 0;
+    }
 
     case WM_PAINT:
     {
@@ -602,6 +739,12 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
     wc.lpszClassName = L"ConsoleLoader";
     wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     RegisterClassW(&wc);
+    WNDCLASSW scrollClass{};
+    scrollClass.lpfnWndProc = ScrollBarProc;
+    scrollClass.hInstance = hInst;
+    scrollClass.lpszClassName = L"ConsoleLoaderScrollbar";
+    scrollClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    RegisterClassW(&scrollClass);
 
     g_baseTitle = L"ConsoleLoader - " + target;
     g_hWnd = CreateWindowW(wc.lpszClassName, g_baseTitle.c_str(),
