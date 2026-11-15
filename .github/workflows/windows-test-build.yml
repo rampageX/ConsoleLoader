@@ -5,6 +5,7 @@ on:
     branches:
       - master
       - feature/window-size-highlight
+      - fix/close-process-lifetime-0.4
   workflow_dispatch:
 
 permissions:
@@ -27,6 +28,13 @@ jobs:
         run: |
           windres ConsoleLoader.rc -O coff -o ConsoleLoader_res.o
           g++ -std=c++17 -O2 -pipe -municode -mwindows ConsoleLoader.cpp ConsoleLoader_res.o -o ConsoleLoader.exe -static-libstdc++ -static-libgcc -lole32 -luuid -lcomctl32 -ldwmapi -lgdi32 -lshell32
+      - name: Compile GUI child process fixture
+        shell: msys2 {0}
+        run: |
+          g++ -std=c++17 -O2 -mwindows tests/KeepAlive.cpp -o TestTray.exe
+      - name: Verify close-window process cleanup
+        shell: pwsh
+        run: ./tests/close-regression.ps1
       - name: Upload Windows executable
         uses: actions/upload-artifact@v4
         with:
