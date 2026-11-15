@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <cwchar>
 #include <cstring>
+#include <atomic>
 
 #pragma comment(lib, "dwmapi.lib")
 
@@ -22,12 +23,41 @@ HWND   g_hScroll = nullptr;
 HANDLE g_hRead = nullptr;
 HANDLE g_hProc = nullptr;
 HANDLE g_hJob  = nullptr;
+HANDLE g_hPipeThread = nullptr;
+std::atomic<bool> g_shuttingDown{false};
 
 #define WM_APPEND (WM_APP + 1)
 #define IDM_COPY_SIZE 0x1F00
 #define TIMER_COPY_NOTICE 7
+#define TIMER_CI_CLOSE 8
+#define TIMER_STARTUP_ACTIVATE 9
 
 std::wstring g_baseTitle;
+static int g_activationAttempts = 0;
+
+// After UAC consent, Windows may leave a newly created window behind Explorer.
+// Raise it only during startup; never keep the topmost extended style.
+// Windows may deny SetForegroundWindow under foreground lock policy, so use
+// a reversible z-order bump as a fallback for visibility.
+static void ActivateStartupWindow(HWND hwnd)
+{
+    if (!hwnd || !IsWindow(hwnd) || IsIconic(hwnd)) return;
+
+    if (GetForegroundWindow() == hwnd)
+    {
+        KillTimer(hwnd, TIMER_STARTUP_ACTIVATE);
+        return;
+    }
+
+    const UINT flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOOWNERZORDER |
+                       SWP_NOACTIVATE | SWP_SHOWWINDOW;
+    SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, flags);
+    SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, flags);
+    SetForegroundWindow(hwnd);
+    if (GetForegroundWindow() == hwnd)
+        KillTimer(hwnd, TIMER_STARTUP_ACTIVATE);
+}
+
 
 static bool ParseWindowSize(const std::wstring& input, int& width, int& height)
 {
@@ -525,9 +555,11 @@ std::wstring DecodeOutput(const std::string& bytes)
 
 static void PostOutput(const std::string& bytes)
 {
-    if (bytes.empty()) return;
+    if (bytes.empty() || g_shuttingDown.load(std::memory_order_acquire)) return;
     auto* ws = new std::wstring(DecodeOutput(bytes));
-    if (!PostMessageW(g_hWnd, WM_APPEND, 0, reinterpret_cast<LPARAM>(ws))) delete ws;
+    if (g_shuttingDown.load(std::memory_order_acquire) ||
+        !PostMessageW(g_hWnd, WM_APPEND, 0, reinterpret_cast<LPARAM>(ws)))
+        delete ws;
 }
 
 /* ================= 管道线程 ================= */
@@ -537,8 +569,10 @@ DWORD WINAPI PipeThread(LPVOID)
     char buf[4096];
     DWORD read = 0;
     std::string pending;
-    while (ReadFile(g_hRead, buf, sizeof(buf), &read, nullptr) && read)
+    while (!g_shuttingDown.load(std::memory_order_acquire) &&
+           ReadFile(g_hRead, buf, sizeof(buf), &read, nullptr) && read)
     {
+        if (g_shuttingDown.load(std::memory_order_acquire)) break;
         pending.append(buf, read);
         std::string batch;
         for (;;)
@@ -554,7 +588,7 @@ DWORD WINAPI PipeThread(LPVOID)
         }
         PostOutput(batch);  // One UI message per pipe read, not one per output line.
     }
-    if (!pending.empty())
+    if (!pending.empty() && !g_shuttingDown.load(std::memory_order_acquire))
     {
         if (pending.back() == '\r') pending.pop_back();
         pending += "\r\n";
@@ -645,6 +679,19 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l)
         break;
 
     case WM_TIMER:
+        if (w == TIMER_STARTUP_ACTIVATE)
+        {
+            if (++g_activationAttempts >= 5)
+                KillTimer(hWnd, TIMER_STARTUP_ACTIVATE);
+            ActivateStartupWindow(hWnd);
+            return 0;
+        }
+        if (w == TIMER_CI_CLOSE)
+        {
+            KillTimer(hWnd, TIMER_CI_CLOSE);
+            PostMessageW(hWnd, WM_CLOSE, 0, 0);
+            return 0;
+        }
         if (w == TIMER_COPY_NOTICE)
         {
             KillTimer(hWnd, TIMER_COPY_NOTICE);
@@ -694,12 +741,55 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l)
     }
 
     case WM_DESTROY:
+    {
         KillTimer(hWnd, TIMER_COPY_NOTICE);
+        KillTimer(hWnd, TIMER_CI_CLOSE);
+        KillTimer(hWnd, TIMER_STARTUP_ACTIVATE);
+
+        // Stop the pipe worker *before* closing its read handle.
+        // A detached GUI child can keep an inherited stdout pipe writer open,
+        // so waiting for EOF is not a reliable shutdown mechanism.
+        g_shuttingDown.store(true, std::memory_order_release);
+
+        // Close the job to stop our direct console command. Detached GUI
+        // children remain outside the job (SILENT_BREAKAWAY_OK).
         if (g_hJob) { CloseHandle(g_hJob); g_hJob = nullptr; }
-        if (g_hRead) { CloseHandle(g_hRead); g_hRead = nullptr; }
         if (g_hProc) { CloseHandle(g_hProc); g_hProc = nullptr; }
+
+        if (g_hPipeThread)
+        {
+            // Cancel blocking ReadFile on the worker. Retry also covers the
+            // short window between checking the shutdown flag and ReadFile.
+            for (int attempt = 0; attempt < 20; ++attempt)
+            {
+                if (WaitForSingleObject(g_hPipeThread, 0) == WAIT_OBJECT_0)
+                    break;
+                CancelSynchronousIo(g_hPipeThread);
+                if (WaitForSingleObject(g_hPipeThread, 50) == WAIT_OBJECT_0)
+                    break;
+            }
+
+            // Do not close a pipe handle while another thread is using it.
+            // Windows will close any remaining handles at process exit.
+            const bool workerExited =
+                WaitForSingleObject(g_hPipeThread, 0) == WAIT_OBJECT_0;
+            CloseHandle(g_hPipeThread);
+            g_hPipeThread = nullptr;
+            if (workerExited && g_hRead)
+            {
+                CloseHandle(g_hRead);
+                g_hRead = nullptr;
+            }
+        }
+        else if (g_hRead)
+        {
+            CloseHandle(g_hRead);
+            g_hRead = nullptr;
+        }
+
         PostQuitMessage(0);
         return 0;
+    }
     }
     return DefWindowProcW(hWnd, msg, w, l);
 }
@@ -792,12 +882,30 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
 
     g_baseTitle = L"ConsoleLoader - " + target;
     g_hWnd = CreateWindowW(wc.lpszClassName, g_baseTitle.c_str(),
-            WS_OVERLAPPEDWINDOW | WS_VISIBLE, left, top,
+            WS_OVERLAPPEDWINDOW, left, top,
             width, height, nullptr, nullptr, hInst, nullptr);
     if (!g_hWnd) return 1;
+
+    // Show explicitly after the UAC-elevated process has started, rather than
+    // relying on WS_VISIBLE during CreateWindow.
+    ShowWindow(g_hWnd, SW_SHOWNORMAL);
+    UpdateWindow(g_hWnd);
+    ActivateStartupWindow(g_hWnd);
+    // Bounded retry handles timing around the secure desktop handover.
+    // Once foreground activation succeeds no further attempts are made.
+    if (GetForegroundWindow() != g_hWnd)
+        SetTimer(g_hWnd, TIMER_STARTUP_ACTIVATE, 300, nullptr);
     // WM_SIZE during CreateWindow precedes assignment to g_hWnd.
     // Lay out child controls once the main window handle is available.
     UpdateScrollLayout();
+
+    // Regression-runner hook: GitHub's Windows service desktop cannot
+    // enumerate GUI windows from the test process. This environment variable
+    // makes the app deliver WM_CLOSE to itself; normal launches are unchanged.
+    wchar_t ciCloseFlag[8]{};
+    if (GetEnvironmentVariableW(L"CONSOLELOADER_CI_AUTOCLOSE", ciCloseFlag, 8) &&
+        wcscmp(ciCloseFlag, L"1") == 0)
+        SetTimer(g_hWnd, TIMER_CI_CLOSE, 2000, nullptr);
 
     g_hJob = CreateJobObjectW(nullptr, nullptr);
     if (g_hJob)
@@ -844,9 +952,9 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
             AppendText(L"ERROR: 启动失败: " + WinError(launchError) + L"\r\n命令: " + cmd + L"\r\n");
         else
         {
-            HANDLE thread = CreateThread(nullptr, 0, PipeThread, nullptr, 0, nullptr);
-            if (thread) CloseHandle(thread);
-            else AppendText(L"ERROR: 无法创建输出读取线程: " + WinError(GetLastError()) + L"\r\n");
+            g_hPipeThread = CreateThread(nullptr, 0, PipeThread, nullptr, 0, nullptr);
+            if (!g_hPipeThread)
+                AppendText(L"ERROR: 无法创建输出读取线程: " + WinError(GetLastError()) + L"\r\n");
         }
     }
 
