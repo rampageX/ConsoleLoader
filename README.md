@@ -26,7 +26,7 @@ windres ConsoleLoader.rc -O coff -o ConsoleLoader_res.o
 g++ -std=c++17 -O2 -pipe -municode -mwindows ConsoleLoader.cpp ConsoleLoader_res.o -o ConsoleLoader.exe -static-libstdc++ -static-libgcc -lole32 -luuid -lcomctl32 -ldwmapi -lgdi32 -lshell32
 ```
 
-Windows x64 test builds run in GitHub Actions on branch `feature/window-size-highlight`. The test executable is an Actions artifact, **not** a Release asset.
+Windows x64 builds run in GitHub Actions on `master` and the test branch. Test executables are available as Actions artifacts; official versioned binaries are published in [Releases](https://github.com/rampageX/ConsoleLoader/releases).
 
 ## Compatibility
 
