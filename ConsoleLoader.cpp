@@ -158,8 +158,8 @@ static void UpdateScrollLayout()
 
     RECT rc{};
     GetClientRect(g_hWnd, &rc);
-    const int width = (std::max)(0, rc.right - rc.left - 2);
-    const int height = (std::max)(0, rc.bottom - rc.top - 2);
+    const int width = (std::max)(0, static_cast<int>(rc.right - rc.left - 2));
+    const int height = (std::max)(0, static_cast<int>(rc.bottom - rc.top - 2));
     constexpr int barWidth = 12;
 
     // First measure with all available width. A narrower editor could
