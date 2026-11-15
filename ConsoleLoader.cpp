@@ -30,8 +30,34 @@ std::atomic<bool> g_shuttingDown{false};
 #define IDM_COPY_SIZE 0x1F00
 #define TIMER_COPY_NOTICE 7
 #define TIMER_CI_CLOSE 8
+#define TIMER_STARTUP_ACTIVATE 9
 
 std::wstring g_baseTitle;
+static int g_activationAttempts = 0;
+
+// After UAC consent, Windows may leave a newly created window behind Explorer.
+// Raise it only during startup; never keep the topmost extended style.
+// Windows may deny SetForegroundWindow under foreground lock policy, so use
+// a reversible z-order bump as a fallback for visibility.
+static void ActivateStartupWindow(HWND hwnd)
+{
+    if (!hwnd || !IsWindow(hwnd) || IsIconic(hwnd)) return;
+
+    if (GetForegroundWindow() == hwnd)
+    {
+        KillTimer(hwnd, TIMER_STARTUP_ACTIVATE);
+        return;
+    }
+
+    const UINT flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOOWNERZORDER |
+                       SWP_NOACTIVATE | SWP_SHOWWINDOW;
+    SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, flags);
+    SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, flags);
+    SetForegroundWindow(hwnd);
+    if (GetForegroundWindow() == hwnd)
+        KillTimer(hwnd, TIMER_STARTUP_ACTIVATE);
+}
+
 
 static bool ParseWindowSize(const std::wstring& input, int& width, int& height)
 {
@@ -653,6 +679,13 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l)
         break;
 
     case WM_TIMER:
+        if (w == TIMER_STARTUP_ACTIVATE)
+        {
+            if (++g_activationAttempts >= 5)
+                KillTimer(hWnd, TIMER_STARTUP_ACTIVATE);
+            ActivateStartupWindow(hWnd);
+            return 0;
+        }
         if (w == TIMER_CI_CLOSE)
         {
             KillTimer(hWnd, TIMER_CI_CLOSE);
@@ -711,6 +744,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l)
     {
         KillTimer(hWnd, TIMER_COPY_NOTICE);
         KillTimer(hWnd, TIMER_CI_CLOSE);
+        KillTimer(hWnd, TIMER_STARTUP_ACTIVATE);
 
         // Stop the pipe worker *before* closing its read handle.
         // A detached GUI child can keep an inherited stdout pipe writer open,
@@ -848,9 +882,19 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
 
     g_baseTitle = L"ConsoleLoader - " + target;
     g_hWnd = CreateWindowW(wc.lpszClassName, g_baseTitle.c_str(),
-            WS_OVERLAPPEDWINDOW | WS_VISIBLE, left, top,
+            WS_OVERLAPPEDWINDOW, left, top,
             width, height, nullptr, nullptr, hInst, nullptr);
     if (!g_hWnd) return 1;
+
+    // Show explicitly after the UAC-elevated process has started, rather than
+    // relying on WS_VISIBLE during CreateWindow.
+    ShowWindow(g_hWnd, SW_SHOWNORMAL);
+    UpdateWindow(g_hWnd);
+    ActivateStartupWindow(g_hWnd);
+    // Bounded retry handles timing around the secure desktop handover.
+    // Once foreground activation succeeds no further attempts are made.
+    if (GetForegroundWindow() != g_hWnd)
+        SetTimer(g_hWnd, TIMER_STARTUP_ACTIVATE, 300, nullptr);
     // WM_SIZE during CreateWindow precedes assignment to g_hWnd.
     // Lay out child controls once the main window handle is available.
     UpdateScrollLayout();
