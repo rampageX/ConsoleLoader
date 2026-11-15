@@ -28,6 +28,17 @@ jobs:
         run: |
           windres ConsoleLoader.rc -O coff -o ConsoleLoader_res.o
           g++ -std=c++17 -O2 -pipe -municode -mwindows ConsoleLoader.cpp ConsoleLoader_res.o -o ConsoleLoader.exe -static-libstdc++ -static-libgcc -lole32 -luuid -lcomctl32 -ldwmapi -lgdi32 -lshell32
+      - name: Verify Windows version information
+        shell: pwsh
+        run: |
+          $exe = (Resolve-Path ./ConsoleLoader.exe).Path
+          $info = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($exe)
+          Write-Host "FileDescription=$($info.FileDescription)"
+          Write-Host "FileVersion=$($info.FileVersion)"
+          Write-Host "ProductVersion=$($info.ProductVersion)"
+          if ($info.FileVersion -ne '0.4.1.0') { throw 'Invalid EXE FileVersion' }
+          if ($info.ProductVersion -ne '0.4.1') { throw 'Invalid EXE ProductVersion' }
+          if ($info.FileDescription -notlike '*0.4.1*') { throw 'EXE tooltip description lacks version' }
       - name: Compile GUI child process fixture
         shell: msys2 {0}
         run: |
@@ -43,15 +54,15 @@ jobs:
           if-no-files-found: error
 
   release:
-    # Explicitly publish 0.4 once, when merging the maintainer-tested code
-    # under a release-marked merge commit on master. No automatic upgrades.
-    if: "${{ github.event_name == 'push' && github.ref == 'refs/heads/master' && startsWith(github.event.head_commit.message, 'release: 0.4') }}"
+    # Explicit one-off publication only when the tested PR is merged under
+    # the exact release-marked commit message. Never overwrite old releases.
+    if: "${{ github.event_name == 'push' && github.ref == 'refs/heads/master' && startsWith(github.event.head_commit.message, 'release: 0.4.1') }}"
     needs: build
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
-      - name: Download verified build
+      - name: Download verified Windows executable
         uses: actions/download-artifact@v4
         with:
           name: ConsoleLoader-win-x64-test
@@ -62,31 +73,27 @@ jobs:
           file ConsoleLoader.exe | grep -Fq 'PE32+ executable'
           file ConsoleLoader.exe | grep -Fq 'x86-64'
           sha256sum ConsoleLoader.exe
-      - name: Create release 0.4
+      - name: Publish release 0.4.1
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
-          if gh release view 0.4 >/dev/null 2>&1; then
-            echo "::error::Release 0.4 already exists. Refusing to overwrite it."
+          if gh release view 0.4.1 >/dev/null 2>&1; then
+            echo "::error::Release 0.4.1 already exists. Refusing overwrite."
             exit 1
           fi
           cat > RELEASE_NOTES.md <<'EOF'
-          ## ConsoleLoader 0.4
+          ## ConsoleLoader 0.4.1
 
-          - **Custom window size:** add `WIDTHxHEIGHT` at the end of the shortcut command, for example `ConsoleLoader.exe "script.cmd" 430x220`.
-          - **Copy window size:** right-click the title bar and copy the current outer window dimensions.
-          - **Centered startup:** open on the monitor containing the mouse pointer, centered within its work area.
-          - **Polished GUI:** light/dark custom scrollbar appears only when needed, without bright seams.
-          - **Status highlighting:** common service states, success/error/warning messages, and latency values.
-          - **Output support:** UTF-8 with legacy OEM code page fallback, batched UI output and clearer startup errors.
-          - **Process lifetime:** GUI applications independently launched by a batch script can survive closing ConsoleLoader.
+          - **Version details:** Explorer mouse-hover information and EXE Properties > Details now include FileVersion 0.4.1.0, ProductVersion 0.4.1 and a versioned file description.
+          - **Exit cleanup:** closing ConsoleLoader while CMD is running now cancels the blocked pipe reader and closes its handles safely; independently launched applications such as Proxifier stay running.
+          - **UAC focus:** the elevated ConsoleLoader window restores foreground focus after UAC consent without staying always-on-top.
+          - Retains the 0.4 window-size argument, title-bar size copying, centered startup, conditional dark scrollbar, status highlighting and UTF-8/OEM support.
 
-          **Compatibility:** Windows x64. Built with MSYS2 UCRT64 / C++17.
-          **Validation:** GitHub Actions Windows x64 build and maintainer testing.
+          **Validation:** MSYS2 UCRT64 x64 build, Windows VERSIONINFO verification and real Win32 process lifetime regression.
           EOF
-          gh release create 0.4 ConsoleLoader.exe \
-            --title "ConsoleLoader 0.4" \
+          gh release create 0.4.1 ConsoleLoader.exe \
+            --title "ConsoleLoader 0.4.1" \
             --target "$GITHUB_SHA" \
             --notes-file RELEASE_NOTES.md \
             --latest
