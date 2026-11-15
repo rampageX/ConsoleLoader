@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <cwchar>
 #include <cstring>
+#include <atomic>
 
 #pragma comment(lib, "dwmapi.lib")
 
@@ -22,6 +23,8 @@ HWND   g_hScroll = nullptr;
 HANDLE g_hRead = nullptr;
 HANDLE g_hProc = nullptr;
 HANDLE g_hJob  = nullptr;
+HANDLE g_hPipeThread = nullptr;
+std::atomic<bool> g_shuttingDown{false};
 
 #define WM_APPEND (WM_APP + 1)
 #define IDM_COPY_SIZE 0x1F00
@@ -525,9 +528,11 @@ std::wstring DecodeOutput(const std::string& bytes)
 
 static void PostOutput(const std::string& bytes)
 {
-    if (bytes.empty()) return;
+    if (bytes.empty() || g_shuttingDown.load(std::memory_order_acquire)) return;
     auto* ws = new std::wstring(DecodeOutput(bytes));
-    if (!PostMessageW(g_hWnd, WM_APPEND, 0, reinterpret_cast<LPARAM>(ws))) delete ws;
+    if (g_shuttingDown.load(std::memory_order_acquire) ||
+        !PostMessageW(g_hWnd, WM_APPEND, 0, reinterpret_cast<LPARAM>(ws)))
+        delete ws;
 }
 
 /* ================= 管道线程 ================= */
@@ -537,8 +542,10 @@ DWORD WINAPI PipeThread(LPVOID)
     char buf[4096];
     DWORD read = 0;
     std::string pending;
-    while (ReadFile(g_hRead, buf, sizeof(buf), &read, nullptr) && read)
+    while (!g_shuttingDown.load(std::memory_order_acquire) &&
+           ReadFile(g_hRead, buf, sizeof(buf), &read, nullptr) && read)
     {
+        if (g_shuttingDown.load(std::memory_order_acquire)) break;
         pending.append(buf, read);
         std::string batch;
         for (;;)
@@ -554,7 +561,7 @@ DWORD WINAPI PipeThread(LPVOID)
         }
         PostOutput(batch);  // One UI message per pipe read, not one per output line.
     }
-    if (!pending.empty())
+    if (!pending.empty() && !g_shuttingDown.load(std::memory_order_acquire))
     {
         if (pending.back() == '\r') pending.pop_back();
         pending += "\r\n";
@@ -694,12 +701,53 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l)
     }
 
     case WM_DESTROY:
+    {
         KillTimer(hWnd, TIMER_COPY_NOTICE);
+
+        // Stop the pipe worker *before* closing its read handle.
+        // A detached GUI child can keep an inherited stdout pipe writer open,
+        // so waiting for EOF is not a reliable shutdown mechanism.
+        g_shuttingDown.store(true, std::memory_order_release);
+
+        // Close the job to stop our direct console command. Detached GUI
+        // children remain outside the job (SILENT_BREAKAWAY_OK).
         if (g_hJob) { CloseHandle(g_hJob); g_hJob = nullptr; }
-        if (g_hRead) { CloseHandle(g_hRead); g_hRead = nullptr; }
         if (g_hProc) { CloseHandle(g_hProc); g_hProc = nullptr; }
+
+        if (g_hPipeThread)
+        {
+            // Cancel blocking ReadFile on the worker. Retry also covers the
+            // short window between checking the shutdown flag and ReadFile.
+            for (int attempt = 0; attempt < 20; ++attempt)
+            {
+                if (WaitForSingleObject(g_hPipeThread, 0) == WAIT_OBJECT_0)
+                    break;
+                CancelSynchronousIo(g_hPipeThread);
+                if (WaitForSingleObject(g_hPipeThread, 50) == WAIT_OBJECT_0)
+                    break;
+            }
+
+            // Do not close a pipe handle while another thread is using it.
+            // Windows will close any remaining handles at process exit.
+            const bool workerExited =
+                WaitForSingleObject(g_hPipeThread, 0) == WAIT_OBJECT_0;
+            CloseHandle(g_hPipeThread);
+            g_hPipeThread = nullptr;
+            if (workerExited && g_hRead)
+            {
+                CloseHandle(g_hRead);
+                g_hRead = nullptr;
+            }
+        }
+        else if (g_hRead)
+        {
+            CloseHandle(g_hRead);
+            g_hRead = nullptr;
+        }
+
         PostQuitMessage(0);
         return 0;
+    }
     }
     return DefWindowProcW(hWnd, msg, w, l);
 }
@@ -844,9 +892,9 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
             AppendText(L"ERROR: 启动失败: " + WinError(launchError) + L"\r\n命令: " + cmd + L"\r\n");
         else
         {
-            HANDLE thread = CreateThread(nullptr, 0, PipeThread, nullptr, 0, nullptr);
-            if (thread) CloseHandle(thread);
-            else AppendText(L"ERROR: 无法创建输出读取线程: " + WinError(GetLastError()) + L"\r\n");
+            g_hPipeThread = CreateThread(nullptr, 0, PipeThread, nullptr, 0, nullptr);
+            if (!g_hPipeThread)
+                AppendText(L"ERROR: 无法创建输出读取线程: " + WinError(GetLastError()) + L"\r\n");
         }
     }
 
