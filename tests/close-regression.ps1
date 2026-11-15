@@ -1,16 +1,5 @@
 $ErrorActionPreference = 'Stop'
 
-Add-Type -TypeDefinition @'
-using System;
-using System.Runtime.InteropServices;
-public static class CLWin32 {
-    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
-    public static extern IntPtr FindWindowW(string className, string windowName);
-    [DllImport("user32.dll", SetLastError = true)]
-    public static extern bool PostMessageW(IntPtr hwnd, uint msg, IntPtr wParam, IntPtr lParam);
-}
-'@
-
 $root = (Get-Location).Path
 $script = Join-Path $root 'cl-test-close.cmd'
 $pidFile = Join-Path $root 'cl-test-child.pid'
@@ -26,7 +15,13 @@ start "" /B "$childExe"
 ping -n 35 127.0.0.1 >nul
 "@ | Set-Content -Path $script -Encoding ASCII
 
-$launcherProc = Start-Process -FilePath $launcher -ArgumentList "`"$script`" 430x220" -WorkingDirectory $root -PassThru
+$env:CONSOLELOADER_CI_AUTOCLOSE = '1'
+try {
+    $launcherProc = Start-Process -FilePath $launcher -ArgumentList "`"$script`" 430x220" -WorkingDirectory $root -PassThru
+}
+finally {
+    Remove-Item Env:CONSOLELOADER_CI_AUTOCLOSE -ErrorAction SilentlyContinue
+}
 $childPid = $null
 try {
     for ($i = 0; $i -lt 80; $i++) {
@@ -42,18 +37,9 @@ try {
     }
     if (!$childPid) { throw 'Detached GUI child did not start.' }
 
-    $hwnd = [IntPtr]::Zero
-    for ($i = 0; $i -lt 50; $i++) {
-        $hwnd = [CLWin32]::FindWindowW('ConsoleLoader', $null)
-        if ($hwnd -ne [IntPtr]::Zero) { break }
-        Start-Sleep -Milliseconds 100
-    }
-    if ($hwnd -eq [IntPtr]::Zero) { throw 'ConsoleLoader window not found.' }
-    if (-not [CLWin32]::PostMessageW($hwnd, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero)) {
-        throw 'Unable to send WM_CLOSE.'
-    }
-
-    if (-not $launcherProc.WaitForExit(6000)) {
+    # The app posts WM_CLOSE to itself after 2 seconds in CI-only mode.
+    # No interactive desktop or HWND enumeration is needed on GitHub's runner.
+    if (-not $launcherProc.WaitForExit(10000)) {
         throw 'REGRESSION: ConsoleLoader.exe remains after closing its window.'
     }
     if (-not (Get-Process -Id $childPid -ErrorAction SilentlyContinue)) {
