@@ -11,6 +11,8 @@
 #include <vector>
 #include <limits>
 #include <cstdlib>
+#include <cwchar>
+#include <cstring>
 
 #pragma comment(lib, "dwmapi.lib")
 
@@ -687,7 +689,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
     {
         if (argv) LocalFree(argv);
         MessageBoxW(nullptr,
-            L"用法: ConsoleLoader.exe \"xxx.cmd\" [430x220]\\n也支持目标程序及其参数。",
+            L"用法: ConsoleLoader.exe \"xxx.cmd\" [430x220]\n也支持目标程序及其参数.",
             L"ConsoleLoader", MB_ICONINFORMATION);
         return 1;
     }
@@ -719,7 +721,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
         if (!n || n >= 32768)
         {
             GetSystemDirectoryW(comspec, 32768);
-            wcscat_s(comspec, L"\\cmd.exe");
+            wcscat_s(comspec, 32768, L"\\cmd.exe");
         }
         // cmd /S /C requires doubled outer quotes around a quoted batch path.
         cmd = QuoteWinArg(comspec) + L" /D /S /C \"\"" + target + L"\"";
