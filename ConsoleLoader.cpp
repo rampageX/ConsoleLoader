@@ -365,22 +365,28 @@ static LRESULT CALLBACK ScrollBarProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l)
 
 static WNDPROC g_OrigEditProc = nullptr;
 
-static void AutoCopySelection(HWND edit)
+static std::wstring SelectedPlainText(HWND edit)
 {
-    if (!g_autoCopy || !edit) return;
+    if (!edit) return {};
     CHARRANGE selection{};
     SendMessageW(edit, EM_EXGETSEL, 0, reinterpret_cast<LPARAM>(&selection));
-    if (selection.cpMax <= selection.cpMin) return;
+    if (selection.cpMax <= selection.cpMin) return {};
 
     const size_t count = static_cast<size_t>(selection.cpMax - selection.cpMin);
     std::wstring value(count + 1, L'\0');
     const LRESULT copied = SendMessageW(edit, EM_GETSELTEXT, 0,
                                         reinterpret_cast<LPARAM>(&value[0]));
-    if (copied > 0 && static_cast<size_t>(copied) <= count)
-    {
-        value.resize(static_cast<size_t>(copied));
+    if (copied <= 0 || static_cast<size_t>(copied) > count) return {};
+    value.resize(static_cast<size_t>(copied));
+    return value;
+}
+
+static void AutoCopySelection(HWND edit)
+{
+    if (!g_autoCopy) return;
+    const std::wstring value = SelectedPlainText(edit);
+    if (!value.empty())
         CopyClipboard(g_hWnd, value); // Plain Unicode text; no rich-text formatting.
-    }
 }
 
 static LRESULT CALLBACK EditSubclassProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
