@@ -41,9 +41,9 @@ jobs:
           Write-Host "FileDescription=$($info.FileDescription)"
           Write-Host "FileVersion=$($info.FileVersion)"
           Write-Host "ProductVersion=$($info.ProductVersion)"
-          if ($info.FileVersion -ne '0.4.2.0') { throw 'Invalid EXE FileVersion' }
-          if ($info.ProductVersion -ne '0.4.2') { throw 'Invalid EXE ProductVersion' }
-          if ($info.FileDescription -notlike '*0.4.2*') { throw 'EXE tooltip description lacks version' }
+          if ($info.FileVersion -ne '0.4.3.0') { throw 'Invalid EXE FileVersion' }
+          if ($info.ProductVersion -ne '0.4.3') { throw 'Invalid EXE ProductVersion' }
+          if ($info.FileDescription -notlike '*0.4.3*') { throw 'EXE tooltip description lacks version' }
       - name: Compile GUI child process fixture
         shell: msys2 {0}
         run: |
@@ -75,7 +75,7 @@ jobs:
   release:
     # Explicit one-off publication only when the tested PR is merged under
     # the exact release-marked commit message. Never overwrite old releases.
-    if: "${{ github.event_name == 'push' && github.ref == 'refs/heads/master' && startsWith(github.event.head_commit.message, 'release: 0.4.2') }}"
+    if: "${{ github.event_name == 'push' && github.ref == 'refs/heads/master' && startsWith(github.event.head_commit.message, 'release: 0.4.3') }}"
     needs: build
     runs-on: ubuntu-latest
     permissions:
@@ -92,28 +92,29 @@ jobs:
           file ConsoleLoader.exe | grep -Fq 'PE32+ executable'
           file ConsoleLoader.exe | grep -Fq 'x86-64'
           sha256sum ConsoleLoader.exe
-      - name: Publish release 0.4.2
+      - name: Publish release 0.4.3
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
-          if gh release view 0.4.2 >/dev/null 2>&1; then
-            echo "::error::Release 0.4.2 already exists. Refusing overwrite."
+          if gh release view 0.4.3 >/dev/null 2>&1; then
+            echo "::error::Release 0.4.3 already exists. Refusing overwrite."
             exit 1
           fi
           cat > RELEASE_NOTES.md <<'EOF'
-          ## ConsoleLoader 0.4.2
+          ## ConsoleLoader 0.4.3
 
-          - **Send To compatibility:** accept window size (e.g. `650x400`) immediately after the target executable, so Explorer can append selected media files without interfering with window size parsing.
-          - **Backward compatible:** the existing trailing `WIDTHxHEIGHT` syntax still works. File paths with spaces and Unicode and multiple selected files remain forwarded with correct quoting.
-          - **No extra console window:** native Win32 GUI launcher continues to use `CREATE_NO_WINDOW`; no intermediary batch wrapper is needed.
-          - **Version information:** Explorer tooltip and Properties > Details updated to FileVersion 0.4.2.0 / ProductVersion 0.4.2.
-          - Retains previous 0.4.1 fixes: clean process exit, UAC focus restoration, center startup, light/dark scrollbar and output highlighting.
+          - **Auto-copy selection:** title-bar system menu checkbox to copy selected RichEdit text as plain Unicode when finishing selection. Disabled by default.
+          - **Native font picker:** choose font family, point size and style through Windows ChooseFont; applies to existing/future report text while retaining status highlights.
+          - **Grayscale anti-aliasing:** optional title-bar checkbox, now retained after user visual verification. Reduces ClearType RGB fringes on dark backgrounds; uncheck to restore the original Windows font smoothing.
+          - **Persistent settings:** save auto-copy, typeface, size, style and AA preference under HKCU\\Software\\rampageX\\ConsoleLoader. No extra INI or configuration file, no administrator rights required.
+          - **Version details:** Explorer FileVersion 0.4.3.0 and ProductVersion 0.4.3.
+          - Retains 0.4.2 Send To size-argument compatibility and previous startup/close fixes.
 
-          **Validated:** Windows x64 MSYS2 UCRT64 build, VERSIONINFO check, Send To single/multiple file argument regression, Unicode/special-path handling, invalid size fallback and process-close regression.
+          **Validation:** Windows x64 MSYS2 build; native registry persistence, Unicode selection, font/AA toggle and highlight-preservation checks; Send To argument regressions; process-close regression. Grayscale appearance confirmed by Windows user test.
           EOF
-          gh release create 0.4.2 ConsoleLoader.exe \
-            --title "ConsoleLoader 0.4.2" \
+          gh release create 0.4.3 ConsoleLoader.exe \
+            --title "ConsoleLoader 0.4.3" \
             --target "$GITHUB_SHA" \
             --notes-file RELEASE_NOTES.md \
             --latest
