@@ -2,6 +2,7 @@
 #include <windows.h>
 #include <dwmapi.h>
 #include <richedit.h>
+#include <commdlg.h>
 #include <string>
 #include <cwctype>
 #include <shellapi.h>
@@ -28,12 +29,90 @@ std::atomic<bool> g_shuttingDown{false};
 
 #define WM_APPEND (WM_APP + 1)
 #define IDM_COPY_SIZE 0x1F00
+#define IDM_AUTO_COPY 0x1F10
+#define IDM_CHOOSE_FONT 0x1F20
 #define TIMER_COPY_NOTICE 7
 #define TIMER_CI_CLOSE 8
 #define TIMER_STARTUP_ACTIVATE 9
 
 std::wstring g_baseTitle;
 static int g_activationAttempts = 0;
+
+// Per-user settings; no external configuration file and no elevation needed.
+static const wchar_t* g_settingsKey = L"Software\\rampageX\\ConsoleLoader";
+static bool g_autoCopy = false;
+static std::wstring g_fontName = L"Consolas";
+static DWORD g_fontSize = 9;  // Points.
+static DWORD g_fontWeight = FW_NORMAL;
+static DWORD g_fontItalic = 0;
+static HFONT g_displayFont = nullptr;
+
+static void LoadSettings()
+{
+    // Reset to defaults if the key or one of its values is missing/invalid.
+    g_autoCopy = false;
+    g_fontName = L"Consolas";
+    g_fontSize = 9;
+    g_fontWeight = FW_NORMAL;
+    g_fontItalic = 0;
+
+    HKEY key = nullptr;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, g_settingsKey, 0, KEY_QUERY_VALUE, &key) != ERROR_SUCCESS)
+        return;
+
+    auto readDword = [key](const wchar_t* name, DWORD& value) {
+        DWORD type = 0, size = sizeof(DWORD), read = 0;
+        if (RegQueryValueExW(key, name, nullptr, &type,
+                            reinterpret_cast<LPBYTE>(&read), &size) == ERROR_SUCCESS &&
+            type == REG_DWORD && size == sizeof(DWORD))
+            value = read;
+    };
+
+    DWORD copy = 0;
+    readDword(L"AutoCopy", copy);
+    g_autoCopy = copy != 0;
+
+    wchar_t face[LF_FACESIZE]{};
+    DWORD type = 0, size = sizeof(face);
+    if (RegQueryValueExW(key, L"FontName", nullptr, &type,
+                         reinterpret_cast<LPBYTE>(face), &size) == ERROR_SUCCESS &&
+        type == REG_SZ && face[0])
+    {
+        face[LF_FACESIZE - 1] = L'\0';
+        g_fontName = face;
+    }
+
+    readDword(L"FontSize", g_fontSize);
+    readDword(L"FontWeight", g_fontWeight);
+    readDword(L"FontItalic", g_fontItalic);
+    if (g_fontSize < 6 || g_fontSize > 96) g_fontSize = 9;
+    if (g_fontWeight > 1000) g_fontWeight = FW_NORMAL;
+    g_fontItalic = g_fontItalic != 0;
+    RegCloseKey(key);
+}
+
+static bool SaveSettings()
+{
+    HKEY key = nullptr;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, g_settingsKey, 0, nullptr, 0,
+                        KEY_SET_VALUE, nullptr, &key, nullptr) != ERROR_SUCCESS)
+        return false;
+
+    auto writeDword = [key](const wchar_t* name, DWORD value) {
+        return RegSetValueExW(key, name, 0, REG_DWORD,
+                             reinterpret_cast<const BYTE*>(&value), sizeof(value)) == ERROR_SUCCESS;
+    };
+    const bool saved =
+        writeDword(L"AutoCopy", g_autoCopy ? 1 : 0) &&
+        RegSetValueExW(key, L"FontName", 0, REG_SZ,
+                       reinterpret_cast<const BYTE*>(g_fontName.c_str()),
+                       static_cast<DWORD>((g_fontName.size() + 1) * sizeof(wchar_t))) == ERROR_SUCCESS &&
+        writeDword(L"FontSize", g_fontSize) &&
+        writeDword(L"FontWeight", g_fontWeight) &&
+        writeDword(L"FontItalic", g_fontItalic);
+    RegCloseKey(key);
+    return saved;
+}
 
 // After UAC consent, Windows may leave a newly created window behind Explorer.
 // Raise it only during startup; never keep the topmost extended style.
@@ -153,7 +232,8 @@ static int EditLineHeight()
     if (!g_hEdit) return 16;
     HDC dc = GetDC(g_hEdit);
     if (!dc) return 16;
-    HFONT font = reinterpret_cast<HFONT>(SendMessageW(g_hEdit, WM_GETFONT, 0, 0));
+    HFONT font = g_displayFont ? g_displayFont :
+        reinterpret_cast<HFONT>(SendMessageW(g_hEdit, WM_GETFONT, 0, 0));
     HGDIOBJ previous = font ? SelectObject(dc, font) : nullptr;
     TEXTMETRICW metrics{};
     GetTextMetricsW(dc, &metrics);
@@ -281,9 +361,27 @@ static LRESULT CALLBACK ScrollBarProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l)
     return DefWindowProcW(hwnd, msg, w, l);
 }
 
-/* ================= 仅为滚轮支持新增：RichEdit 子类化 ================= */
+/* ================= RichEdit 子类化：滚轮与用户选取自动复制 ================= */
 
 static WNDPROC g_OrigEditProc = nullptr;
+
+static void AutoCopySelection(HWND edit)
+{
+    if (!g_autoCopy || !edit) return;
+    CHARRANGE selection{};
+    SendMessageW(edit, EM_EXGETSEL, 0, reinterpret_cast<LPARAM>(&selection));
+    if (selection.cpMax <= selection.cpMin) return;
+
+    const size_t count = static_cast<size_t>(selection.cpMax - selection.cpMin);
+    std::wstring value(count + 1, L'\0');
+    const LRESULT copied = SendMessageW(edit, EM_GETSELTEXT, 0,
+                                        reinterpret_cast<LPARAM>(&value[0]));
+    if (copied > 0 && static_cast<size_t>(copied) <= count)
+    {
+        value.resize(static_cast<size_t>(copied));
+        CopyClipboard(g_hWnd, value); // Plain Unicode text; no rich-text formatting.
+    }
+}
 
 static LRESULT CALLBACK EditSubclassProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
@@ -303,6 +401,13 @@ static LRESULT CALLBACK EditSubclassProc(HWND hWnd, UINT msg, WPARAM wParam, LPA
     }
     }
     LRESULT result = CallWindowProcW(g_OrigEditProc, hWnd, msg, wParam, lParam);
+    // Copy only on user selection-completion events. Never react to the
+    // internal selection changes used for appending and highlighting output.
+    if (msg == WM_LBUTTONUP ||
+        (msg == WM_KEYUP &&
+         (wParam == VK_SHIFT ||
+          (wParam == 'A' && (GetKeyState(VK_CONTROL) & 0x8000)))))
+        AutoCopySelection(hWnd);
     if (g_hScroll && (msg == WM_KEYDOWN || msg == WM_VSCROLL ||
                       msg == WM_LBUTTONUP || msg == WM_SIZE))
         InvalidateRect(g_hScroll, nullptr, FALSE);
@@ -461,8 +566,9 @@ void AppendText(const std::wstring& text)
     RECT rc{};
     GetClientRect(g_hEdit, &rc);
     HDC dc = GetDC(g_hEdit);
-    HFONT oldFont = reinterpret_cast<HFONT>(SelectObject(
-        dc, reinterpret_cast<HGDIOBJ>(SendMessageW(g_hEdit, WM_GETFONT, 0, 0))));
+    HFONT display = g_displayFont ? g_displayFont :
+        reinterpret_cast<HFONT>(SendMessageW(g_hEdit, WM_GETFONT, 0, 0));
+    HFONT oldFont = reinterpret_cast<HFONT>(SelectObject(dc, display));
     TEXTMETRICW tm{};
     GetTextMetricsW(dc, &tm);
     SelectObject(dc, oldFont);
