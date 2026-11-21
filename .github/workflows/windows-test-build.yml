@@ -6,6 +6,10 @@ on:
       - master
       - feature/window-size-highlight
       - fix/close-process-lifetime-0.4
+      - 'fix/**'
+  pull_request:
+    branches:
+      - master
   workflow_dispatch:
 
 permissions:
@@ -43,6 +47,13 @@ jobs:
         shell: msys2 {0}
         run: |
           g++ -std=c++17 -O2 -mwindows tests/KeepAlive.cpp -o TestTray.exe
+      - name: Compile argument forwarding fixture
+        shell: msys2 {0}
+        run: |
+          g++ -std=c++17 -O2 -municode tests/ArgCapture.cpp -o ArgCapture.exe
+      - name: Verify Send To window-size argument handling
+        shell: pwsh
+        run: ./tests/sendto-regression.ps1
       - name: Verify close-window process cleanup
         shell: pwsh
         run: ./tests/close-regression.ps1
