@@ -31,6 +31,7 @@ std::atomic<bool> g_shuttingDown{false};
 #define IDM_COPY_SIZE 0x1F00
 #define IDM_AUTO_COPY 0x1F10
 #define IDM_CHOOSE_FONT 0x1F20
+#define IDM_GRAYSCALE_AA 0x1F30
 #define TIMER_COPY_NOTICE 7
 #define TIMER_CI_CLOSE 8
 #define TIMER_STARTUP_ACTIVATE 9
@@ -41,6 +42,8 @@ static int g_activationAttempts = 0;
 // Per-user settings; no external configuration file and no elevation needed.
 static const wchar_t* g_settingsKey = L"Software\\rampageX\\ConsoleLoader";
 static bool g_autoCopy = false;
+// Experimental: request GDI grayscale antialiasing per font, not system-wide.
+static bool g_grayAA = false;
 static std::wstring g_fontName = L"Consolas";
 static DWORD g_fontSize = 9;  // Points.
 static DWORD g_fontWeight = FW_NORMAL;
@@ -51,6 +54,7 @@ static void LoadSettings()
 {
     // Reset to defaults if the key or one of its values is missing/invalid.
     g_autoCopy = false;
+    g_grayAA = false;
     g_fontName = L"Consolas";
     g_fontSize = 9;
     g_fontWeight = FW_NORMAL;
@@ -71,6 +75,9 @@ static void LoadSettings()
     DWORD copy = 0;
     readDword(L"AutoCopy", copy);
     g_autoCopy = copy != 0;
+    DWORD grayscale = 0;
+    readDword(L"GrayscaleAA", grayscale);
+    g_grayAA = grayscale != 0;
 
     wchar_t face[LF_FACESIZE]{};
     DWORD type = 0, size = sizeof(face);
@@ -104,6 +111,7 @@ static bool SaveSettings()
     };
     const bool saved =
         writeDword(L"AutoCopy", g_autoCopy ? 1 : 0) &&
+        writeDword(L"GrayscaleAA", g_grayAA ? 1 : 0) &&
         RegSetValueExW(key, L"FontName", 0, REG_SZ,
                        reinterpret_cast<const BYTE*>(g_fontName.c_str()),
                        static_cast<DWORD>((g_fontName.size() + 1) * sizeof(wchar_t))) == ERROR_SUCCESS &&
@@ -657,6 +665,11 @@ static void ApplyDisplayFont()
     lf.lfWeight = static_cast<LONG>(g_fontWeight);
     lf.lfItalic = static_cast<BYTE>(g_fontItalic);
     lf.lfCharSet = DEFAULT_CHARSET;
+    // RichEdit stores font family/size in CHARFORMAT but lacks a quality field.
+    // WM_SETFONT supplies the requested rasterization quality to its host font.
+    // Actual grayscale rendering depends on the RichEdit/GDI text engine:
+    // this is opt-in so the unchanged ClearType path remains available.
+    lf.lfQuality = g_grayAA ? ANTIALIASED_QUALITY : CLEARTYPE_QUALITY;
     lstrcpynW(lf.lfFaceName, g_fontName.c_str(), LF_FACESIZE);
 
     HFONT newFont = CreateFontIndirectW(&lf);
@@ -676,6 +689,7 @@ static void ApplyDisplayFont()
     SendMessageW(g_hEdit, EM_GETSCROLLPOS, 0, reinterpret_cast<LPARAM>(&scroll));
 
     SendMessageW(g_hEdit, WM_SETREDRAW, FALSE, 0);
+    SendMessageW(g_hEdit, WM_SETFONT, reinterpret_cast<WPARAM>(newFont), FALSE);
     // SCF_ALL changes the existing report while retaining each span's color.
     // SCF_DEFAULT also controls the font of lines appended in the future.
     SendMessageW(g_hEdit, EM_SETCHARFORMAT, SCF_ALL, reinterpret_cast<LPARAM>(&cf));
@@ -842,6 +856,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l)
             AppendMenuW(systemMenu, MF_SEPARATOR, 0, nullptr);
             AppendMenuW(systemMenu, MF_STRING, IDM_AUTO_COPY, L"选中后自动复制");
             AppendMenuW(systemMenu, MF_STRING, IDM_CHOOSE_FONT, L"字体与字号...");
+            AppendMenuW(systemMenu, MF_STRING, IDM_GRAYSCALE_AA, L"灰度抗锯齿（实验）");
         }
         ApplyDarkTitleBar(hWnd);
         ApplyDarkRichEdit(g_hEdit);
@@ -861,10 +876,23 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l)
                         MF_BYCOMMAND | MF_STRING, IDM_COPY_SIZE, caption.c_str());
             CheckMenuItem(GetSystemMenu(hWnd, FALSE), IDM_AUTO_COPY,
                           MF_BYCOMMAND | (g_autoCopy ? MF_CHECKED : MF_UNCHECKED));
+            CheckMenuItem(GetSystemMenu(hWnd, FALSE), IDM_GRAYSCALE_AA,
+                          MF_BYCOMMAND | (g_grayAA ? MF_CHECKED : MF_UNCHECKED));
         }
         break;
 
     case WM_SYSCOMMAND:
+        if ((w & 0xFFF0) == IDM_GRAYSCALE_AA)
+        {
+            g_grayAA = !g_grayAA;
+            ApplyDisplayFont();
+            CheckMenuItem(GetSystemMenu(hWnd, FALSE), IDM_GRAYSCALE_AA,
+                          MF_BYCOMMAND | (g_grayAA ? MF_CHECKED : MF_UNCHECKED));
+            if (!SaveSettings())
+                MessageBoxW(hWnd, L"抗锯齿模式已切换，但无法保存到注册表。",
+                            L"ConsoleLoader", MB_ICONWARNING);
+            return 0;
+        }
         if ((w & 0xFFF0) == IDM_AUTO_COPY)
         {
             g_autoCopy = !g_autoCopy;
