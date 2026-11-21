@@ -627,12 +627,95 @@ void ApplyDarkRichEdit(HWND hEdit)
 
     CHARFORMATW cf{};
     cf.cbSize = sizeof(cf);
-    cf.dwMask = CFM_COLOR | CFM_FACE | CFM_SIZE;
+    // Theme changes must not reset a user-selected font or font size.
+    cf.dwMask = CFM_COLOR;
     cf.crTextColor = dark ? RGB(220,220,220) : RGB(0,0,0);
-    lstrcpyW(cf.szFaceName, L"Consolas");
-    cf.yHeight = 180; // 9pt
-
     SendMessageW(hEdit, EM_SETCHARFORMAT, SCF_ALL, (LPARAM)&cf);
+}
+
+static int CurrentFontDpi()
+{
+    if (!g_hEdit) return 96;
+    HDC dc = GetDC(g_hEdit);
+    if (!dc) return 96;
+    const int dpi = GetDeviceCaps(dc, LOGPIXELSY);
+    ReleaseDC(g_hEdit, dc);
+    return dpi > 0 ? dpi : 96;
+}
+
+static void ApplyDisplayFont()
+{
+    if (!g_hEdit) return;
+    LOGFONTW lf{};
+    lf.lfHeight = -MulDiv(static_cast<int>(g_fontSize), CurrentFontDpi(), 72);
+    lf.lfWeight = static_cast<LONG>(g_fontWeight);
+    lf.lfItalic = static_cast<BYTE>(g_fontItalic);
+    lf.lfCharSet = DEFAULT_CHARSET;
+    lstrcpynW(lf.lfFaceName, g_fontName.c_str(), LF_FACESIZE);
+
+    HFONT newFont = CreateFontIndirectW(&lf);
+    if (!newFont) return;
+
+    CHARFORMATW cf{};
+    cf.cbSize = sizeof(cf);
+    cf.dwMask = CFM_FACE | CFM_SIZE | CFM_BOLD | CFM_ITALIC;
+    cf.yHeight = static_cast<LONG>(g_fontSize * 20); // RichEdit uses twips.
+    lstrcpynW(cf.szFaceName, g_fontName.c_str(), LF_FACESIZE);
+    cf.dwEffects = (g_fontWeight >= FW_BOLD ? CFE_BOLD : 0) |
+                   (g_fontItalic ? CFE_ITALIC : 0);
+
+    CHARRANGE previousSelection{};
+    POINT scroll{};
+    SendMessageW(g_hEdit, EM_EXGETSEL, 0, reinterpret_cast<LPARAM>(&previousSelection));
+    SendMessageW(g_hEdit, EM_GETSCROLLPOS, 0, reinterpret_cast<LPARAM>(&scroll));
+
+    SendMessageW(g_hEdit, WM_SETREDRAW, FALSE, 0);
+    // SCF_ALL changes the existing report while retaining each span's color.
+    // SCF_DEFAULT also controls the font of lines appended in the future.
+    SendMessageW(g_hEdit, EM_SETCHARFORMAT, SCF_ALL, reinterpret_cast<LPARAM>(&cf));
+    SendMessageW(g_hEdit, EM_SETCHARFORMAT, SCF_DEFAULT, reinterpret_cast<LPARAM>(&cf));
+    SendMessageW(g_hEdit, EM_EXSETSEL, 0, reinterpret_cast<LPARAM>(&previousSelection));
+    SendMessageW(g_hEdit, EM_SETSCROLLPOS, 0, reinterpret_cast<LPARAM>(&scroll));
+    SendMessageW(g_hEdit, WM_SETREDRAW, TRUE, 0);
+
+    HFONT previousFont = g_displayFont;
+    g_displayFont = newFont; // Used by the existing scrollbar/visible-line metrics.
+    if (previousFont) DeleteObject(previousFont);
+    UpdateScrollLayout();
+    InvalidateRect(g_hEdit, nullptr, TRUE);
+    if (g_hScroll) InvalidateRect(g_hScroll, nullptr, TRUE);
+}
+
+static void ChooseDisplayFont(HWND owner)
+{
+    LOGFONTW lf{};
+    lf.lfHeight = -MulDiv(static_cast<int>(g_fontSize), CurrentFontDpi(), 72);
+    lf.lfWeight = static_cast<LONG>(g_fontWeight);
+    lf.lfItalic = static_cast<BYTE>(g_fontItalic);
+    lf.lfCharSet = DEFAULT_CHARSET;
+    lstrcpynW(lf.lfFaceName, g_fontName.c_str(), LF_FACESIZE);
+
+    CHOOSEFONTW choice{};
+    choice.lStructSize = sizeof(choice);
+    choice.hwndOwner = owner;
+    choice.lpLogFont = &lf;
+    choice.Flags = CF_SCREENFONTS | CF_INITTOLOGFONTSTRUCT | CF_LIMITSIZE;
+    choice.nSizeMin = 6;
+    choice.nSizeMax = 96;
+    if (!ChooseFontW(&choice))
+    {
+        if (CommDlgExtendedError() != 0)
+            MessageBoxW(owner, L"无法打开系统字体选择对话框。", L"ConsoleLoader", MB_ICONWARNING);
+        return; // Cancel leaves all settings untouched.
+    }
+
+    g_fontName = lf.lfFaceName;
+    g_fontSize = (std::max)(6L, (std::min)(96L, (choice.iPointSize + 5) / 10));
+    g_fontWeight = static_cast<DWORD>((std::max)(0L, (std::min)(1000L, lf.lfWeight)));
+    g_fontItalic = lf.lfItalic ? 1 : 0;
+    ApplyDisplayFont();
+    if (!SaveSettings())
+        MessageBoxW(owner, L"字体已应用，但无法保存到当前用户的注册表。", L"ConsoleLoader", MB_ICONWARNING);
 }
 
 /* ================= 工具 ================= */
@@ -711,6 +794,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l)
     {
     case WM_CREATE:
     {
+        LoadSettings();
         LoadLibraryW(L"Msftedit.dll");
 
         // 设置主窗口图标（来自资源 IDI_APPICON）
@@ -748,9 +832,13 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l)
         {
             AppendMenuW(systemMenu, MF_SEPARATOR, 0, nullptr);
             AppendMenuW(systemMenu, MF_STRING, IDM_COPY_SIZE, L"复制当前窗口尺寸");
+            AppendMenuW(systemMenu, MF_SEPARATOR, 0, nullptr);
+            AppendMenuW(systemMenu, MF_STRING, IDM_AUTO_COPY, L"选中后自动复制");
+            AppendMenuW(systemMenu, MF_STRING, IDM_CHOOSE_FONT, L"字体与字号...");
         }
         ApplyDarkTitleBar(hWnd);
         ApplyDarkRichEdit(g_hEdit);
+        ApplyDisplayFont();
         return 0;
     }
 
@@ -764,10 +852,27 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l)
                 std::to_wstring(r.bottom - r.top);
             ModifyMenuW(GetSystemMenu(hWnd, FALSE), IDM_COPY_SIZE,
                         MF_BYCOMMAND | MF_STRING, IDM_COPY_SIZE, caption.c_str());
+            CheckMenuItem(GetSystemMenu(hWnd, FALSE), IDM_AUTO_COPY,
+                          MF_BYCOMMAND | (g_autoCopy ? MF_CHECKED : MF_UNCHECKED));
         }
         break;
 
     case WM_SYSCOMMAND:
+        if ((w & 0xFFF0) == IDM_AUTO_COPY)
+        {
+            g_autoCopy = !g_autoCopy;
+            CheckMenuItem(GetSystemMenu(hWnd, FALSE), IDM_AUTO_COPY,
+                          MF_BYCOMMAND | (g_autoCopy ? MF_CHECKED : MF_UNCHECKED));
+            if (!SaveSettings())
+                MessageBoxW(hWnd, L"选中后自动复制已切换，但无法保存到注册表。",
+                            L"ConsoleLoader", MB_ICONWARNING);
+            return 0;
+        }
+        if ((w & 0xFFF0) == IDM_CHOOSE_FONT)
+        {
+            ChooseDisplayFont(hWnd);
+            return 0;
+        }
         if ((w & 0xFFF0) == IDM_COPY_SIZE)
         {
             RECT r{};
@@ -851,6 +956,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l)
         KillTimer(hWnd, TIMER_COPY_NOTICE);
         KillTimer(hWnd, TIMER_CI_CLOSE);
         KillTimer(hWnd, TIMER_STARTUP_ACTIVATE);
+        if (g_displayFont) { DeleteObject(g_displayFont); g_displayFont = nullptr; }
 
         // Stop the pipe worker *before* closing its read handle.
         // A detached GUI child can keep an inherited stdout pipe writer open,
