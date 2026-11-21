@@ -668,8 +668,8 @@ static void ApplyDisplayFont()
     // RichEdit stores font family/size in CHARFORMAT but lacks a quality field.
     // WM_SETFONT supplies the requested rasterization quality to its host font.
     // Actual grayscale rendering depends on the RichEdit/GDI text engine:
-    // this is opt-in so the unchanged ClearType path remains available.
-    lf.lfQuality = g_grayAA ? ANTIALIASED_QUALITY : CLEARTYPE_QUALITY;
+    // this is opt-in so the original Windows-configured path remains available.
+    lf.lfQuality = g_grayAA ? ANTIALIASED_QUALITY : DEFAULT_QUALITY;
     lstrcpynW(lf.lfFaceName, g_fontName.c_str(), LF_FACESIZE);
 
     HFONT newFont = CreateFontIndirectW(&lf);
