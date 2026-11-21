@@ -31,7 +31,7 @@ jobs:
         shell: msys2 {0}
         run: |
           windres ConsoleLoader.rc -O coff -o ConsoleLoader_res.o
-          g++ -std=c++17 -O2 -pipe -municode -mwindows ConsoleLoader.cpp ConsoleLoader_res.o -o ConsoleLoader.exe -static-libstdc++ -static-libgcc -lole32 -luuid -lcomctl32 -ldwmapi -lgdi32 -lshell32
+          g++ -std=c++17 -O2 -pipe -municode -mwindows ConsoleLoader.cpp ConsoleLoader_res.o -o ConsoleLoader.exe -static-libstdc++ -static-libgcc -lole32 -luuid -lcomctl32 -ldwmapi -lgdi32 -lshell32 -lcomdlg32
       - name: Verify Windows version information
         shell: pwsh
         run: |
