@@ -10,10 +10,12 @@ Lightweight native Win32 GUI wrapper for Windows console applications and batch 
 ConsoleLoader.exe "D:\Scripts\Start.cmd"
 ConsoleLoader.exe "D:\Scripts\Start.cmd" 430x220
 ConsoleLoader.exe "C:\Windows\System32\ping.exe" 8.8.8.8 -t 640x360
+ConsoleLoader.exe "E:\PotPlayer+\Tools\mediainfo\mediainfo.exe" 650x400 "D:\Videos\example.mp4"
 ```
 
-- Optional **last** parameter `WIDTHxHEIGHT`: outer window size in pixels, from 320x160 through 8192x8192.
+- Optional `WIDTHxHEIGHT`: outer window size in pixels, from 320x160 through 8192x8192. Place it **last** (original syntax) or **immediately after the target executable** (for Windows Explorer **Send to** shortcuts that append selected file paths). Other arguments are passed through unchanged.
 - Without the size parameter, the window uses the original 1280x720 default.
+- **Send to setup:** press Win+R, run `shell:sendto`, and create a shortcut whose **Target** is `"D:\BaiduSync\Public\CMD\ConsoleLoader.exe" "E:\PotPlayer+\Tools\mediainfo\mediainfo.exe" 650x400`. Explorer automatically appends the selected video file path(s); no intermediary `.cmd` and no console flash.
 - Resize a window by dragging its borders, right-click the **title bar**, select **复制窗口尺寸: WIDTHxHEIGHT**, then paste that dimension into the shortcut target.
 - Closing ConsoleLoader stops its directly launched process. Applications launched independently by a script (for example `start "" "C:\Program Files (x86)\Proxifier\Proxifier.exe"`) are not killed.
 - stdout/stderr output is decoded as UTF-8 when valid, otherwise with the system OEM code page. Windows status lines and numerical latency values are colored.

@@ -812,18 +812,28 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
     }
 
     int width = 1280, height = 720;
-    int last = argc;
+    int sizeIndex = -1;
     int requestedW = 0, requestedH = 0;
+    // The final argument is the original syntax. Windows Explorer's Send To
+    // shortcuts append selected file paths AFTER shortcut arguments, so also
+    // accept the window size immediately after the target executable.
+    // Prefer the final position to preserve existing command lines.
     if (argc >= 3 && ParseWindowSize(argv[argc - 1], requestedW, requestedH))
+        sizeIndex = argc - 1;
+    else if (argc >= 3 && ParseWindowSize(argv[2], requestedW, requestedH))
+        sizeIndex = 2;
+
+    if (sizeIndex != -1)
     {
-        width = requestedW; height = requestedH;
-        --last;
+        width = requestedW;
+        height = requestedH;
     }
 
     std::wstring target = argv[1];
     std::wstring args;
-    for (int i = 2; i < last; ++i)
+    for (int i = 2; i < argc; ++i)
     {
+        if (i == sizeIndex) continue;
         if (!args.empty()) args += L" ";
         args += QuoteWinArg(argv[i]);
     }
