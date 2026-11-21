@@ -40,9 +40,9 @@ jobs:
           Write-Host "FileDescription=$($info.FileDescription)"
           Write-Host "FileVersion=$($info.FileVersion)"
           Write-Host "ProductVersion=$($info.ProductVersion)"
-          if ($info.FileVersion -ne '0.4.1.0') { throw 'Invalid EXE FileVersion' }
-          if ($info.ProductVersion -ne '0.4.1') { throw 'Invalid EXE ProductVersion' }
-          if ($info.FileDescription -notlike '*0.4.1*') { throw 'EXE tooltip description lacks version' }
+          if ($info.FileVersion -ne '0.4.2.0') { throw 'Invalid EXE FileVersion' }
+          if ($info.ProductVersion -ne '0.4.2') { throw 'Invalid EXE ProductVersion' }
+          if ($info.FileDescription -notlike '*0.4.2*') { throw 'EXE tooltip description lacks version' }
       - name: Compile GUI child process fixture
         shell: msys2 {0}
         run: |
@@ -67,7 +67,7 @@ jobs:
   release:
     # Explicit one-off publication only when the tested PR is merged under
     # the exact release-marked commit message. Never overwrite old releases.
-    if: "${{ github.event_name == 'push' && github.ref == 'refs/heads/master' && startsWith(github.event.head_commit.message, 'release: 0.4.1') }}"
+    if: "${{ github.event_name == 'push' && github.ref == 'refs/heads/master' && startsWith(github.event.head_commit.message, 'release: 0.4.2') }}"
     needs: build
     runs-on: ubuntu-latest
     permissions:
@@ -84,27 +84,28 @@ jobs:
           file ConsoleLoader.exe | grep -Fq 'PE32+ executable'
           file ConsoleLoader.exe | grep -Fq 'x86-64'
           sha256sum ConsoleLoader.exe
-      - name: Publish release 0.4.1
+      - name: Publish release 0.4.2
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
-          if gh release view 0.4.1 >/dev/null 2>&1; then
-            echo "::error::Release 0.4.1 already exists. Refusing overwrite."
+          if gh release view 0.4.2 >/dev/null 2>&1; then
+            echo "::error::Release 0.4.2 already exists. Refusing overwrite."
             exit 1
           fi
           cat > RELEASE_NOTES.md <<'EOF'
-          ## ConsoleLoader 0.4.1
+          ## ConsoleLoader 0.4.2
 
-          - **Version details:** Explorer mouse-hover information and EXE Properties > Details now include FileVersion 0.4.1.0, ProductVersion 0.4.1 and a versioned file description.
-          - **Exit cleanup:** closing ConsoleLoader while CMD is running now cancels the blocked pipe reader and closes its handles safely; independently launched applications such as Proxifier stay running.
-          - **UAC focus:** the elevated ConsoleLoader window restores foreground focus after UAC consent without staying always-on-top.
-          - Retains the 0.4 window-size argument, title-bar size copying, centered startup, conditional dark scrollbar, status highlighting and UTF-8/OEM support.
+          - **Send To compatibility:** accept window size (e.g. `650x400`) immediately after the target executable, so Explorer can append selected media files without interfering with window size parsing.
+          - **Backward compatible:** the existing trailing `WIDTHxHEIGHT` syntax still works. File paths with spaces and Unicode and multiple selected files remain forwarded with correct quoting.
+          - **No extra console window:** native Win32 GUI launcher continues to use `CREATE_NO_WINDOW`; no intermediary batch wrapper is needed.
+          - **Version information:** Explorer tooltip and Properties > Details updated to FileVersion 0.4.2.0 / ProductVersion 0.4.2.
+          - Retains previous 0.4.1 fixes: clean process exit, UAC focus restoration, center startup, light/dark scrollbar and output highlighting.
 
-          **Validation:** MSYS2 UCRT64 x64 build, Windows VERSIONINFO verification and real Win32 process lifetime regression.
+          **Validated:** Windows x64 MSYS2 UCRT64 build, VERSIONINFO check, Send To single/multiple file argument regression, Unicode/special-path handling, invalid size fallback and process-close regression.
           EOF
-          gh release create 0.4.1 ConsoleLoader.exe \
-            --title "ConsoleLoader 0.4.1" \
+          gh release create 0.4.2 ConsoleLoader.exe \
+            --title "ConsoleLoader 0.4.2" \
             --target "$GITHUB_SHA" \
             --notes-file RELEASE_NOTES.md \
             --latest
