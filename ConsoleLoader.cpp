@@ -710,7 +710,8 @@ static void ChooseDisplayFont(HWND owner)
     }
 
     g_fontName = lf.lfFaceName;
-    g_fontSize = (std::max)(6L, (std::min)(96L, (choice.iPointSize + 5) / 10));
+    g_fontSize = static_cast<DWORD>((std::max)(6L, (std::min)(96L,
+                 static_cast<LONG>((choice.iPointSize + 5) / 10))));
     g_fontWeight = static_cast<DWORD>((std::max)(0L, (std::min)(1000L, lf.lfWeight)));
     g_fontItalic = lf.lfItalic ? 1 : 0;
     ApplyDisplayFont();
