@@ -2,6 +2,7 @@
 #include <windows.h>
 #include <dwmapi.h>
 #include <richedit.h>
+#include <commdlg.h>
 #include <string>
 #include <cwctype>
 #include <shellapi.h>
@@ -28,12 +29,98 @@ std::atomic<bool> g_shuttingDown{false};
 
 #define WM_APPEND (WM_APP + 1)
 #define IDM_COPY_SIZE 0x1F00
+#define IDM_AUTO_COPY 0x1F10
+#define IDM_CHOOSE_FONT 0x1F20
+#define IDM_GRAYSCALE_AA 0x1F30
 #define TIMER_COPY_NOTICE 7
 #define TIMER_CI_CLOSE 8
 #define TIMER_STARTUP_ACTIVATE 9
 
 std::wstring g_baseTitle;
 static int g_activationAttempts = 0;
+
+// Per-user settings; no external configuration file and no elevation needed.
+static const wchar_t* g_settingsKey = L"Software\\rampageX\\ConsoleLoader";
+static bool g_autoCopy = false;
+// Experimental: request GDI grayscale antialiasing per font, not system-wide.
+static bool g_grayAA = false;
+static std::wstring g_fontName = L"Consolas";
+static DWORD g_fontSize = 9;  // Points.
+static DWORD g_fontWeight = FW_NORMAL;
+static DWORD g_fontItalic = 0;
+static HFONT g_displayFont = nullptr;
+
+static void LoadSettings()
+{
+    // Reset to defaults if the key or one of its values is missing/invalid.
+    g_autoCopy = false;
+    g_grayAA = false;
+    g_fontName = L"Consolas";
+    g_fontSize = 9;
+    g_fontWeight = FW_NORMAL;
+    g_fontItalic = 0;
+
+    HKEY key = nullptr;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, g_settingsKey, 0, KEY_QUERY_VALUE, &key) != ERROR_SUCCESS)
+        return;
+
+    auto readDword = [key](const wchar_t* name, DWORD& value) {
+        DWORD type = 0, size = sizeof(DWORD), read = 0;
+        if (RegQueryValueExW(key, name, nullptr, &type,
+                            reinterpret_cast<LPBYTE>(&read), &size) == ERROR_SUCCESS &&
+            type == REG_DWORD && size == sizeof(DWORD))
+            value = read;
+    };
+
+    DWORD copy = 0;
+    readDword(L"AutoCopy", copy);
+    g_autoCopy = copy != 0;
+    DWORD grayscale = 0;
+    readDword(L"GrayscaleAA", grayscale);
+    g_grayAA = grayscale != 0;
+
+    wchar_t face[LF_FACESIZE]{};
+    DWORD type = 0, size = sizeof(face);
+    if (RegQueryValueExW(key, L"FontName", nullptr, &type,
+                         reinterpret_cast<LPBYTE>(face), &size) == ERROR_SUCCESS &&
+        type == REG_SZ && face[0])
+    {
+        face[LF_FACESIZE - 1] = L'\0';
+        g_fontName = face;
+    }
+
+    readDword(L"FontSize", g_fontSize);
+    readDword(L"FontWeight", g_fontWeight);
+    readDword(L"FontItalic", g_fontItalic);
+    if (g_fontSize < 6 || g_fontSize > 96) g_fontSize = 9;
+    if (g_fontWeight > 1000) g_fontWeight = FW_NORMAL;
+    g_fontItalic = g_fontItalic != 0;
+    RegCloseKey(key);
+}
+
+static bool SaveSettings()
+{
+    HKEY key = nullptr;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, g_settingsKey, 0, nullptr, 0,
+                        KEY_SET_VALUE, nullptr, &key, nullptr) != ERROR_SUCCESS)
+        return false;
+
+    auto writeDword = [key](const wchar_t* name, DWORD value) {
+        return RegSetValueExW(key, name, 0, REG_DWORD,
+                             reinterpret_cast<const BYTE*>(&value), sizeof(value)) == ERROR_SUCCESS;
+    };
+    const bool saved =
+        writeDword(L"AutoCopy", g_autoCopy ? 1 : 0) &&
+        writeDword(L"GrayscaleAA", g_grayAA ? 1 : 0) &&
+        RegSetValueExW(key, L"FontName", 0, REG_SZ,
+                       reinterpret_cast<const BYTE*>(g_fontName.c_str()),
+                       static_cast<DWORD>((g_fontName.size() + 1) * sizeof(wchar_t))) == ERROR_SUCCESS &&
+        writeDword(L"FontSize", g_fontSize) &&
+        writeDword(L"FontWeight", g_fontWeight) &&
+        writeDword(L"FontItalic", g_fontItalic);
+    RegCloseKey(key);
+    return saved;
+}
 
 // After UAC consent, Windows may leave a newly created window behind Explorer.
 // Raise it only during startup; never keep the topmost extended style.
@@ -153,7 +240,8 @@ static int EditLineHeight()
     if (!g_hEdit) return 16;
     HDC dc = GetDC(g_hEdit);
     if (!dc) return 16;
-    HFONT font = reinterpret_cast<HFONT>(SendMessageW(g_hEdit, WM_GETFONT, 0, 0));
+    HFONT font = g_displayFont ? g_displayFont :
+        reinterpret_cast<HFONT>(SendMessageW(g_hEdit, WM_GETFONT, 0, 0));
     HGDIOBJ previous = font ? SelectObject(dc, font) : nullptr;
     TEXTMETRICW metrics{};
     GetTextMetricsW(dc, &metrics);
@@ -281,9 +369,33 @@ static LRESULT CALLBACK ScrollBarProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l)
     return DefWindowProcW(hwnd, msg, w, l);
 }
 
-/* ================= 仅为滚轮支持新增：RichEdit 子类化 ================= */
+/* ================= RichEdit 子类化：滚轮与用户选取自动复制 ================= */
 
 static WNDPROC g_OrigEditProc = nullptr;
+
+static std::wstring SelectedPlainText(HWND edit)
+{
+    if (!edit) return {};
+    CHARRANGE selection{};
+    SendMessageW(edit, EM_EXGETSEL, 0, reinterpret_cast<LPARAM>(&selection));
+    if (selection.cpMax <= selection.cpMin) return {};
+
+    const size_t count = static_cast<size_t>(selection.cpMax - selection.cpMin);
+    std::wstring value(count + 1, L'\0');
+    const LRESULT copied = SendMessageW(edit, EM_GETSELTEXT, 0,
+                                        reinterpret_cast<LPARAM>(&value[0]));
+    if (copied <= 0 || static_cast<size_t>(copied) > count) return {};
+    value.resize(static_cast<size_t>(copied));
+    return value;
+}
+
+static void AutoCopySelection(HWND edit)
+{
+    if (!g_autoCopy) return;
+    const std::wstring value = SelectedPlainText(edit);
+    if (!value.empty())
+        CopyClipboard(g_hWnd, value); // Plain Unicode text; no rich-text formatting.
+}
 
 static LRESULT CALLBACK EditSubclassProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
@@ -303,6 +415,13 @@ static LRESULT CALLBACK EditSubclassProc(HWND hWnd, UINT msg, WPARAM wParam, LPA
     }
     }
     LRESULT result = CallWindowProcW(g_OrigEditProc, hWnd, msg, wParam, lParam);
+    // Copy only on user selection-completion events. Never react to the
+    // internal selection changes used for appending and highlighting output.
+    if (msg == WM_LBUTTONUP ||
+        (msg == WM_KEYUP &&
+         (wParam == VK_SHIFT ||
+          (wParam == 'A' && (GetKeyState(VK_CONTROL) & 0x8000)))))
+        AutoCopySelection(hWnd);
     if (g_hScroll && (msg == WM_KEYDOWN || msg == WM_VSCROLL ||
                       msg == WM_LBUTTONUP || msg == WM_SIZE))
         InvalidateRect(g_hScroll, nullptr, FALSE);
@@ -461,8 +580,9 @@ void AppendText(const std::wstring& text)
     RECT rc{};
     GetClientRect(g_hEdit, &rc);
     HDC dc = GetDC(g_hEdit);
-    HFONT oldFont = reinterpret_cast<HFONT>(SelectObject(
-        dc, reinterpret_cast<HGDIOBJ>(SendMessageW(g_hEdit, WM_GETFONT, 0, 0))));
+    HFONT display = g_displayFont ? g_displayFont :
+        reinterpret_cast<HFONT>(SendMessageW(g_hEdit, WM_GETFONT, 0, 0));
+    HFONT oldFont = reinterpret_cast<HFONT>(SelectObject(dc, display));
     TEXTMETRICW tm{};
     GetTextMetricsW(dc, &tm);
     SelectObject(dc, oldFont);
@@ -521,12 +641,165 @@ void ApplyDarkRichEdit(HWND hEdit)
 
     CHARFORMATW cf{};
     cf.cbSize = sizeof(cf);
-    cf.dwMask = CFM_COLOR | CFM_FACE | CFM_SIZE;
+    // Theme changes must not reset a user-selected font or font size.
+    cf.dwMask = CFM_COLOR;
     cf.crTextColor = dark ? RGB(220,220,220) : RGB(0,0,0);
-    lstrcpyW(cf.szFaceName, L"Consolas");
-    cf.yHeight = 180; // 9pt
-
     SendMessageW(hEdit, EM_SETCHARFORMAT, SCF_ALL, (LPARAM)&cf);
+}
+
+static int CurrentFontDpi()
+{
+    if (!g_hEdit) return 96;
+    HDC dc = GetDC(g_hEdit);
+    if (!dc) return 96;
+    const int dpi = GetDeviceCaps(dc, LOGPIXELSY);
+    ReleaseDC(g_hEdit, dc);
+    return dpi > 0 ? dpi : 96;
+}
+
+// RichEdit's WM_SETFONT normalizes the existing runs and can erase their
+// individually highlighted colors. Snapshot color runs before changing its
+// host font, then restore only CFM_COLOR after the new font has been applied.
+// Divide mixed-color ranges recursively rather than querying every character.
+struct SavedColorRun
+{
+    LONG begin;
+    LONG end;
+    COLORREF color;
+    DWORD autoColor;
+};
+
+static void CaptureColorRuns(LONG begin, LONG end, std::vector<SavedColorRun>& saved)
+{
+    if (begin >= end) return;
+    CHARRANGE range{begin, end};
+    SendMessageW(g_hEdit, EM_EXSETSEL, 0, reinterpret_cast<LPARAM>(&range));
+    CHARFORMATW fmt{};
+    fmt.cbSize = sizeof(fmt);
+    SendMessageW(g_hEdit, EM_GETCHARFORMAT, SCF_SELECTION, reinterpret_cast<LPARAM>(&fmt));
+    if ((fmt.dwMask & CFM_COLOR) != 0)
+    {
+        const DWORD automatic = fmt.dwEffects & CFE_AUTOCOLOR;
+        if (!saved.empty() && saved.back().end == begin &&
+            saved.back().color == fmt.crTextColor && saved.back().autoColor == automatic)
+            saved.back().end = end;
+        else
+            saved.push_back({begin, end, fmt.crTextColor, automatic});
+        return;
+    }
+    if (end - begin <= 1) return;
+    const LONG mid = begin + (end - begin) / 2;
+    CaptureColorRuns(begin, mid, saved);
+    CaptureColorRuns(mid, end, saved);
+}
+
+static void RestoreColorRuns(const std::vector<SavedColorRun>& saved)
+{
+    for (const auto& run : saved)
+    {
+        CHARRANGE range{run.begin, run.end};
+        SendMessageW(g_hEdit, EM_EXSETSEL, 0, reinterpret_cast<LPARAM>(&range));
+        CHARFORMATW fmt{};
+        fmt.cbSize = sizeof(fmt);
+        fmt.dwMask = CFM_COLOR;
+        fmt.dwEffects = run.autoColor;
+        fmt.crTextColor = run.color;
+        SendMessageW(g_hEdit, EM_SETCHARFORMAT, SCF_SELECTION,
+                     reinterpret_cast<LPARAM>(&fmt));
+    }
+}
+
+static void ApplyDisplayFont()
+{
+    if (!g_hEdit) return;
+    LOGFONTW lf{};
+    lf.lfHeight = -MulDiv(static_cast<int>(g_fontSize), CurrentFontDpi(), 72);
+    lf.lfWeight = static_cast<LONG>(g_fontWeight);
+    lf.lfItalic = static_cast<BYTE>(g_fontItalic);
+    lf.lfCharSet = DEFAULT_CHARSET;
+    // RichEdit stores font family/size in CHARFORMAT but lacks a quality field.
+    // WM_SETFONT supplies the requested rasterization quality to its host font.
+    // Actual grayscale rendering depends on the RichEdit/GDI text engine:
+    // this is opt-in so the original Windows-configured path remains available.
+    lf.lfQuality = g_grayAA ? ANTIALIASED_QUALITY : DEFAULT_QUALITY;
+    lstrcpynW(lf.lfFaceName, g_fontName.c_str(), LF_FACESIZE);
+
+    HFONT newFont = CreateFontIndirectW(&lf);
+    if (!newFont) return;
+
+    CHARFORMATW cf{};
+    cf.cbSize = sizeof(cf);
+    cf.dwMask = CFM_FACE | CFM_SIZE | CFM_BOLD | CFM_ITALIC;
+    cf.yHeight = static_cast<LONG>(g_fontSize * 20); // RichEdit uses twips.
+    lstrcpynW(cf.szFaceName, g_fontName.c_str(), LF_FACESIZE);
+    cf.dwEffects = (g_fontWeight >= FW_BOLD ? CFE_BOLD : 0) |
+                   (g_fontItalic ? CFE_ITALIC : 0);
+
+    CHARRANGE previousSelection{};
+    POINT scroll{};
+    SendMessageW(g_hEdit, EM_EXGETSEL, 0, reinterpret_cast<LPARAM>(&previousSelection));
+    SendMessageW(g_hEdit, EM_GETSCROLLPOS, 0, reinterpret_cast<LPARAM>(&scroll));
+
+    SendMessageW(g_hEdit, WM_SETREDRAW, FALSE, 0);
+
+    GETTEXTLENGTHEX textLength{};
+    textLength.flags = GTL_NUMCHARS;
+    textLength.codepage = 1200;
+    const LONG charCount = static_cast<LONG>(SendMessageW(
+        g_hEdit, EM_GETTEXTLENGTHEX, reinterpret_cast<WPARAM>(&textLength), 0));
+    std::vector<SavedColorRun> savedColors;
+    if (charCount > 0)
+        CaptureColorRuns(0, charCount, savedColors);
+
+    SendMessageW(g_hEdit, WM_SETFONT, reinterpret_cast<WPARAM>(newFont), FALSE);
+    // SCF_ALL sets the chosen face/size without changing the color mask.
+    // SCF_DEFAULT controls font for lines appended in the future.
+    SendMessageW(g_hEdit, EM_SETCHARFORMAT, SCF_ALL, reinterpret_cast<LPARAM>(&cf));
+    SendMessageW(g_hEdit, EM_SETCHARFORMAT, SCF_DEFAULT, reinterpret_cast<LPARAM>(&cf));
+    RestoreColorRuns(savedColors);
+    SendMessageW(g_hEdit, EM_EXSETSEL, 0, reinterpret_cast<LPARAM>(&previousSelection));
+    SendMessageW(g_hEdit, EM_SETSCROLLPOS, 0, reinterpret_cast<LPARAM>(&scroll));
+    SendMessageW(g_hEdit, WM_SETREDRAW, TRUE, 0);
+
+    HFONT previousFont = g_displayFont;
+    g_displayFont = newFont; // Used by the existing scrollbar/visible-line metrics.
+    if (previousFont) DeleteObject(previousFont);
+    UpdateScrollLayout();
+    InvalidateRect(g_hEdit, nullptr, TRUE);
+    if (g_hScroll) InvalidateRect(g_hScroll, nullptr, TRUE);
+}
+
+static void ChooseDisplayFont(HWND owner)
+{
+    LOGFONTW lf{};
+    lf.lfHeight = -MulDiv(static_cast<int>(g_fontSize), CurrentFontDpi(), 72);
+    lf.lfWeight = static_cast<LONG>(g_fontWeight);
+    lf.lfItalic = static_cast<BYTE>(g_fontItalic);
+    lf.lfCharSet = DEFAULT_CHARSET;
+    lstrcpynW(lf.lfFaceName, g_fontName.c_str(), LF_FACESIZE);
+
+    CHOOSEFONTW choice{};
+    choice.lStructSize = sizeof(choice);
+    choice.hwndOwner = owner;
+    choice.lpLogFont = &lf;
+    choice.Flags = CF_SCREENFONTS | CF_INITTOLOGFONTSTRUCT | CF_LIMITSIZE;
+    choice.nSizeMin = 6;
+    choice.nSizeMax = 96;
+    if (!ChooseFontW(&choice))
+    {
+        if (CommDlgExtendedError() != 0)
+            MessageBoxW(owner, L"无法打开系统字体选择对话框。", L"ConsoleLoader", MB_ICONWARNING);
+        return; // Cancel leaves all settings untouched.
+    }
+
+    g_fontName = lf.lfFaceName;
+    g_fontSize = static_cast<DWORD>((std::max)(6L, (std::min)(96L,
+                 static_cast<LONG>((choice.iPointSize + 5) / 10))));
+    g_fontWeight = static_cast<DWORD>((std::max)(0L, (std::min)(1000L, lf.lfWeight)));
+    g_fontItalic = lf.lfItalic ? 1 : 0;
+    ApplyDisplayFont();
+    if (!SaveSettings())
+        MessageBoxW(owner, L"字体已应用，但无法保存到当前用户的注册表。", L"ConsoleLoader", MB_ICONWARNING);
 }
 
 /* ================= 工具 ================= */
@@ -605,6 +878,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l)
     {
     case WM_CREATE:
     {
+        LoadSettings();
         LoadLibraryW(L"Msftedit.dll");
 
         // 设置主窗口图标（来自资源 IDI_APPICON）
@@ -642,9 +916,14 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l)
         {
             AppendMenuW(systemMenu, MF_SEPARATOR, 0, nullptr);
             AppendMenuW(systemMenu, MF_STRING, IDM_COPY_SIZE, L"复制当前窗口尺寸");
+            AppendMenuW(systemMenu, MF_SEPARATOR, 0, nullptr);
+            AppendMenuW(systemMenu, MF_STRING, IDM_AUTO_COPY, L"选中后自动复制");
+            AppendMenuW(systemMenu, MF_STRING, IDM_CHOOSE_FONT, L"字体与字号...");
+            AppendMenuW(systemMenu, MF_STRING, IDM_GRAYSCALE_AA, L"灰度抗锯齿（实验）");
         }
         ApplyDarkTitleBar(hWnd);
         ApplyDarkRichEdit(g_hEdit);
+        ApplyDisplayFont();
         return 0;
     }
 
@@ -658,10 +937,40 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l)
                 std::to_wstring(r.bottom - r.top);
             ModifyMenuW(GetSystemMenu(hWnd, FALSE), IDM_COPY_SIZE,
                         MF_BYCOMMAND | MF_STRING, IDM_COPY_SIZE, caption.c_str());
+            CheckMenuItem(GetSystemMenu(hWnd, FALSE), IDM_AUTO_COPY,
+                          MF_BYCOMMAND | (g_autoCopy ? MF_CHECKED : MF_UNCHECKED));
+            CheckMenuItem(GetSystemMenu(hWnd, FALSE), IDM_GRAYSCALE_AA,
+                          MF_BYCOMMAND | (g_grayAA ? MF_CHECKED : MF_UNCHECKED));
         }
         break;
 
     case WM_SYSCOMMAND:
+        if ((w & 0xFFF0) == IDM_GRAYSCALE_AA)
+        {
+            g_grayAA = !g_grayAA;
+            ApplyDisplayFont();
+            CheckMenuItem(GetSystemMenu(hWnd, FALSE), IDM_GRAYSCALE_AA,
+                          MF_BYCOMMAND | (g_grayAA ? MF_CHECKED : MF_UNCHECKED));
+            if (!SaveSettings())
+                MessageBoxW(hWnd, L"抗锯齿模式已切换，但无法保存到注册表。",
+                            L"ConsoleLoader", MB_ICONWARNING);
+            return 0;
+        }
+        if ((w & 0xFFF0) == IDM_AUTO_COPY)
+        {
+            g_autoCopy = !g_autoCopy;
+            CheckMenuItem(GetSystemMenu(hWnd, FALSE), IDM_AUTO_COPY,
+                          MF_BYCOMMAND | (g_autoCopy ? MF_CHECKED : MF_UNCHECKED));
+            if (!SaveSettings())
+                MessageBoxW(hWnd, L"选中后自动复制已切换，但无法保存到注册表。",
+                            L"ConsoleLoader", MB_ICONWARNING);
+            return 0;
+        }
+        if ((w & 0xFFF0) == IDM_CHOOSE_FONT)
+        {
+            ChooseDisplayFont(hWnd);
+            return 0;
+        }
         if ((w & 0xFFF0) == IDM_COPY_SIZE)
         {
             RECT r{};
@@ -745,6 +1054,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l)
         KillTimer(hWnd, TIMER_COPY_NOTICE);
         KillTimer(hWnd, TIMER_CI_CLOSE);
         KillTimer(hWnd, TIMER_STARTUP_ACTIVATE);
+        if (g_displayFont) { DeleteObject(g_displayFont); g_displayFont = nullptr; }
 
         // Stop the pipe worker *before* closing its read handle.
         // A detached GUI child can keep an inherited stdout pipe writer open,
