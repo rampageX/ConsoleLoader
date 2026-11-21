@@ -20,10 +20,11 @@ int wmain()
     try
     {
         LoadSettings();
-        Require(!g_autoCopy && g_fontName == L"Consolas" && g_fontSize == 9,
+        Require(!g_autoCopy && !g_grayAA && g_fontName == L"Consolas" && g_fontSize == 9,
                 "default settings mismatch");
 
         g_autoCopy = true;
+        g_grayAA = true;
         g_fontName = L"Consolas";
         g_fontSize = 14;
         g_fontWeight = FW_BOLD;
@@ -31,12 +32,13 @@ int wmain()
         Require(SaveSettings(), "cannot save HKCU settings");
 
         g_autoCopy = false;
+        g_grayAA = false;
         g_fontName = L"Wrong";
         g_fontSize = 7;
         g_fontWeight = FW_NORMAL;
         g_fontItalic = 0;
         LoadSettings();
-        Require(g_autoCopy && g_fontName == L"Consolas" && g_fontSize == 14 &&
+        Require(g_autoCopy && g_grayAA && g_fontName == L"Consolas" && g_fontSize == 14 &&
                 g_fontWeight == FW_BOLD && g_fontItalic == 1,
                 "HKCU settings round-trip failed");
         puts("PASS: registry defaults and persistent settings");
@@ -84,6 +86,7 @@ int wmain()
                              reinterpret_cast<LPARAM>(&color)) != 0,
                 "cannot apply test color");
 
+        g_grayAA = false;
         g_fontName = L"Consolas";
         g_fontSize = 16;
         g_fontWeight = FW_NORMAL;
@@ -104,6 +107,36 @@ int wmain()
                 wcscmp(actual.szFaceName, L"Consolas") == 0,
                 "font family was not applied to existing text");
         puts("PASS: font dialog settings apply without losing text highlighting");
+
+        LOGFONTW fontInfo{};
+        Require(g_displayFont &&
+                GetObjectW(g_displayFont, sizeof(fontInfo), &fontInfo) == sizeof(fontInfo) &&
+                fontInfo.lfQuality == DEFAULT_QUALITY,
+                "default font has an unexpected smoothing quality");
+
+        g_grayAA = true;
+        ApplyDisplayFont();
+        Require(g_displayFont &&
+                GetObjectW(g_displayFont, sizeof(fontInfo), &fontInfo) == sizeof(fontInfo) &&
+                fontInfo.lfQuality == ANTIALIASED_QUALITY,
+                "experimental grayscale font quality was not set");
+        SendMessageW(g_hEdit, EM_GETCHARFORMAT, SCF_SELECTION,
+                     reinterpret_cast<LPARAM>(&actual));
+        Require((actual.dwMask & CFM_COLOR) != 0 &&
+                actual.crTextColor == RGB(16, 32, 64) &&
+                (actual.dwMask & CFM_SIZE) != 0 && actual.yHeight == 320,
+                "experimental font quality toggle changed text colors or point size");
+        Require(SaveSettings(), "grayscale setting could not be saved");
+        g_grayAA = false;
+        LoadSettings();
+        Require(g_grayAA, "grayscale setting was not restored from HKCU");
+        g_grayAA = false;
+        ApplyDisplayFont();
+        Require(g_displayFont &&
+                GetObjectW(g_displayFont, sizeof(fontInfo), &fontInfo) == sizeof(fontInfo) &&
+                fontInfo.lfQuality == DEFAULT_QUALITY,
+                "switching back did not restore Windows default smoothing");
+        puts("PASS: reversible font-quality hint, registry persistence and formatting");
 
         if (g_displayFont) { DeleteObject(g_displayFont); g_displayFont = nullptr; }
         DestroyWindow(g_hWnd);
