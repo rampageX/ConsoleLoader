@@ -657,6 +657,58 @@ static int CurrentFontDpi()
     return dpi > 0 ? dpi : 96;
 }
 
+// RichEdit's WM_SETFONT normalizes the existing runs and can erase their
+// individually highlighted colors. Snapshot color runs before changing its
+// host font, then restore only CFM_COLOR after the new font has been applied.
+// Divide mixed-color ranges recursively rather than querying every character.
+struct SavedColorRun
+{
+    LONG begin;
+    LONG end;
+    COLORREF color;
+    DWORD autoColor;
+};
+
+static void CaptureColorRuns(LONG begin, LONG end, std::vector<SavedColorRun>& saved)
+{
+    if (begin >= end) return;
+    CHARRANGE range{begin, end};
+    SendMessageW(g_hEdit, EM_EXSETSEL, 0, reinterpret_cast<LPARAM>(&range));
+    CHARFORMATW fmt{};
+    fmt.cbSize = sizeof(fmt);
+    SendMessageW(g_hEdit, EM_GETCHARFORMAT, SCF_SELECTION, reinterpret_cast<LPARAM>(&fmt));
+    if ((fmt.dwMask & CFM_COLOR) != 0)
+    {
+        const DWORD automatic = fmt.dwEffects & CFE_AUTOCOLOR;
+        if (!saved.empty() && saved.back().end == begin &&
+            saved.back().color == fmt.crTextColor && saved.back().autoColor == automatic)
+            saved.back().end = end;
+        else
+            saved.push_back({begin, end, fmt.crTextColor, automatic});
+        return;
+    }
+    if (end - begin <= 1) return;
+    const LONG mid = begin + (end - begin) / 2;
+    CaptureColorRuns(begin, mid, saved);
+    CaptureColorRuns(mid, end, saved);
+}
+
+static void RestoreColorRuns(const std::vector<SavedColorRun>& saved)
+{
+    for (const auto& run : saved)
+    {
+        CHARRANGE range{run.begin, run.end};
+        SendMessageW(g_hEdit, EM_EXSETSEL, 0, reinterpret_cast<LPARAM>(&range));
+        CHARFORMATW fmt{};
+        fmt.cbSize = sizeof(fmt);
+        fmt.dwMask = CFM_COLOR;
+        fmt.dwEffects = run.autoColor;
+        fmt.crTextColor = run.color;
+        SendMessageW(g_hEdit, EM_SETCHARFORMAT, SCF_SELECTION,
+                     reinterpret_cast<LPARAM>(&fmt));
+    }
+}
+
 static void ApplyDisplayFont()
 {
     if (!g_hEdit) return;
@@ -689,11 +741,22 @@ static void ApplyDisplayFont()
     SendMessageW(g_hEdit, EM_GETSCROLLPOS, 0, reinterpret_cast<LPARAM>(&scroll));
 
     SendMessageW(g_hEdit, WM_SETREDRAW, FALSE, 0);
+
+    GETTEXTLENGTHEX textLength{};
+    textLength.flags = GTL_NUMCHARS;
+    textLength.codepage = 1200;
+    const LONG charCount = static_cast<LONG>(SendMessageW(
+        g_hEdit, EM_GETTEXTLENGTHEX, reinterpret_cast<WPARAM>(&textLength), 0));
+    std::vector<SavedColorRun> savedColors;
+    if (charCount > 0)
+        CaptureColorRuns(0, charCount, savedColors);
+
     SendMessageW(g_hEdit, WM_SETFONT, reinterpret_cast<WPARAM>(newFont), FALSE);
-    // SCF_ALL changes the existing report while retaining each span's color.
-    // SCF_DEFAULT also controls the font of lines appended in the future.
+    // SCF_ALL sets the chosen face/size without changing the color mask.
+    // SCF_DEFAULT controls font for lines appended in the future.
     SendMessageW(g_hEdit, EM_SETCHARFORMAT, SCF_ALL, reinterpret_cast<LPARAM>(&cf));
     SendMessageW(g_hEdit, EM_SETCHARFORMAT, SCF_DEFAULT, reinterpret_cast<LPARAM>(&cf));
+    RestoreColorRuns(savedColors);
     SendMessageW(g_hEdit, EM_EXSETSEL, 0, reinterpret_cast<LPARAM>(&previousSelection));
     SendMessageW(g_hEdit, EM_SETSCROLLPOS, 0, reinterpret_cast<LPARAM>(&scroll));
     SendMessageW(g_hEdit, WM_SETREDRAW, TRUE, 0);
