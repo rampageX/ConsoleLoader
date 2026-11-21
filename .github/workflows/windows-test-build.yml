@@ -54,6 +54,13 @@ jobs:
       - name: Verify Send To window-size argument handling
         shell: pwsh
         run: ./tests/sendto-regression.ps1
+      - name: Build native settings regression harness
+        shell: msys2 {0}
+        run: |
+          g++ -std=c++17 -O2 -municode tests/SettingsRegression.cpp -o SettingsRegression.exe -static-libstdc++ -static-libgcc -lole32 -luuid -lcomctl32 -ldwmapi -lgdi32 -lshell32 -lcomdlg32
+      - name: Verify registry persistence and font/highlight behavior
+        shell: pwsh
+        run: ./SettingsRegression.exe
       - name: Verify close-window process cleanup
         shell: pwsh
         run: ./tests/close-regression.ps1
